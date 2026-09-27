@@ -1,2 +1,5 @@
 edge_data
 .venv
+benchmark_data
+indexing_test
+threshold_test
