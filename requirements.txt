@@ -2,3 +2,4 @@ qdrant-edge-py
 qdrant-client 
 numpy
 psutil
+pytest
