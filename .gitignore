@@ -3,7 +3,6 @@ edge_data
 benchmark_data
 indexing_test
 threshold_test
-pycache
-benchmark/__pycache__/
-edge/__pycache__/
-__pycache_
+__pycache__/
+*.py[cod]
+*$py.class
