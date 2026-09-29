@@ -15,7 +15,12 @@ export interface SearchHit { id: string; score?: number | undefined; sourceShard
 export interface SearchResult { hits: SearchHit[]; coverage: Partial<Record<CoverageState, number>>; partial?: boolean | undefined; shortfall?: number | undefined; elapsedMs?: number | undefined }
 export interface ShardItem { id: string; protocol?: string | undefined; mutable?: boolean | undefined; activeContext?: boolean | undefined; availability?: string | undefined; eviction?: string | undefined; location?: "local" | "server_prepared" | undefined }
 
-const BASE = (import.meta.env["VITE_API_BASE_URL"] || "/api/v1").replace(/\/$/, "");
+const RAW_BASE = import.meta.env["VITE_API_BASE_URL"];
+let BASE = (RAW_BASE || "/api/v1").replace(/\/$/, "");
+if (RAW_BASE && !BASE.endsWith("/api/v1")) {
+  BASE = `${BASE}/api/v1`;
+}
+
 const rec = (v: unknown): UnknownRecord => v && typeof v === "object" && !Array.isArray(v) ? v as UnknownRecord : {};
 const arr = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 const num = (...v: unknown[]) => { const x = v.find((n) => typeof n === "number" && Number.isFinite(n)); return typeof x === "number" ? x : undefined };
