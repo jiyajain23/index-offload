@@ -88,7 +88,7 @@ def create_app(
     )
     engine.ensure_loaded("local_write")
 
-    demo_mode = os.environ.get("LIFELINE_DEMO", "0") == "1"
+    demo_mode = os.environ.get("LIFELINE_DEMO", "1") == "1"
     if demo_mode:
         for shard_id, pinned in (("emergency_protocols", True),
                                  ("zone_01", False), ("zone_02", False)):
@@ -134,7 +134,9 @@ def create_app(
     runner = None
     if demo_mode and BeaconRunner is not None:
         try:
-            fixture_path = data_path / "inspection_beacon.avi"
+            fixture_path = Path("fixtures/inspection_beacon.avi")
+            if not fixture_path.exists():
+                fixture_path = data_path / "inspection_beacon.avi"
             if not fixture_path.exists() and make_fixture is not None:
                 make_fixture(fixture_path)
             if fixture_path.exists():
