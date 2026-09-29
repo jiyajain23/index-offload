@@ -5,9 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import sys
 from typing import Mapping
 
 import psutil
+
+
+class _LocalProcessUsage:
+    def memory_info(self):
+        # Linux fallback for a process namespace whose PID is absent in /proc.
+        # ru_maxrss is a high-water mark; do not use it for reclaim estimates.
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return type("Memory", (), {"rss": usage.ru_maxrss * 1024})()
+
+    def cpu_percent(self, interval=None):
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -28,7 +41,14 @@ class ResourceMonitor:
 
     def __init__(self, cgroup_path: str | os.PathLike[str] = "/sys/fs/cgroup", process=None):
         self._cgroup_path = Path(cgroup_path)
-        self._process = process or psutil.Process()
+        try:
+            self._process = process or psutil.Process()
+        except psutil.NoSuchProcess:
+            if sys.platform != "linux":
+                raise
+            # Some isolated runners expose /proc with a different PID namespace.
+            # The cgroup counters remain authoritative; use local rusage for RSS.
+            self._process = _LocalProcessUsage()
 
     def snapshot(self) -> ResourceSnapshot:
         rss = self._process.memory_info().rss

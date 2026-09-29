@@ -28,7 +28,7 @@ class DetectorTelemetryHub:
         self._latencies: deque[float] = deque(maxlen=history_size)
         self._dropped_frames_total = 0
         self._current_queue_depth = 0
-        self._model_name = "yolo-v8s-inspections"
+        self._model_name = "unconfigured"
         self._last_fps = 0.0
         self._is_synthetic = False
         self._lock = threading.Lock()
@@ -86,8 +86,13 @@ class DetectorTelemetryHub:
             "dropped_frames": dropped,
             "queue_depth": queue,
             "model_name": model,
+            "name": model,
+            "detector": model,
+            "source": "synthetic fixture" if is_synth else "live detector",
+            "fixture": "synthetic fixture" if is_synth else "live detector",
+            "review_required": True,
             "is_synthetic": is_synth,
-            "provenance": "SYNTHETIC_STUB" if is_synth else "REAL_HARDWARE_DETECTOR",
+            "provenance": "SYNTHETIC_INPUT" if is_synth else "LIVE_INPUT",
         }
 
 

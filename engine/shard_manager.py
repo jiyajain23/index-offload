@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import gc
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import shutil
 import tarfile
 import threading
 import time
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple
 import uuid
 
 from shared.contracts import (
@@ -80,6 +81,7 @@ class ShardManager(IEngine):
         max_queue_depth: int = 16,
         cooldown_seconds: float = 1.0,
         recovery_hysteresis_mb: float = 10.0,
+        snapshot_is_installed: Optional[Callable[[str], bool]] = None,
     ):
         self.shard_store = shard_store
         self.resource_monitor = resource_monitor
@@ -99,6 +101,7 @@ class ShardManager(IEngine):
         self.cooldown_seconds = cooldown_seconds
         self.max_concurrency = max_concurrency
         self.max_queue_depth = max_queue_depth
+        self.snapshot_is_installed = snapshot_is_installed
 
         self._registrations: Dict[str, ShardRegistration] = {}
         self._loaded: OrderedDict[str, Any] = OrderedDict()
@@ -131,6 +134,8 @@ class ShardManager(IEngine):
         with self._lock:
             if shard_id in self._registrations:
                 raise ValueError(f"Shard already registered: {shard_id}")
+
+            self._recover_activation(Path(path))
 
             ctx_list = list(contexts) if contexts else [shard_id]
             est_cost = int(estimated_cost_mb * MB) if estimated_cost_mb is not None else None
@@ -559,11 +564,14 @@ class ShardManager(IEngine):
                     values=request.sparse_values,
                 )
 
-            point_id = self.to_qdrant_point_id(request.record_id)
+            # Two concurrent edits may have the same record_id and numeric version.
+            # Their unique operation IDs must remain distinct in the vector store.
+            point_id = self.to_qdrant_point_id(request.operation_id or request.record_id)
             pt = Point(
                 id=point_id,
                 vector=vector_dict if vector_dict else {"embedding": [0.0] * 384},
-                payload={"record_id": request.record_id, "version": request.version, **request.payload},
+                payload={"record_id": request.record_id, "version": request.version,
+                         **request.payload, "operation_id": request.operation_id},
             )
 
             try:
@@ -589,13 +597,16 @@ class ShardManager(IEngine):
         """Idempotently delete a record projection."""
         with self._write_lock:
             target_shard = "local_write" if "local_write" in self._registrations else request.context_id
-            if target_shard in self._loaded:
+            if target_shard in self._registrations:
                 try:
-                    point_id = self.to_qdrant_point_id(request.record_id)
+                    point_ids = [self.to_qdrant_point_id(op_id) for op_id in request.operation_ids]
+                    # Also remove points written by older versions of the engine.
+                    point_ids.append(self.to_qdrant_point_id(request.record_id))
                     with self.lease_shard(target_shard) as shard_handle:
-                        self.shard_store.delete_points(shard_handle, [point_id])
+                        self.shard_store.delete_points(shard_handle, point_ids)
                 except Exception as e:
-                    logger.warning("Error deleting projection for %s: %s", request.record_id, e)
+                    return ProjectionReceipt(record_id=request.record_id,
+                        context_id=request.context_id, success=False, error=str(e))
             self._projected_versions.pop(request.record_id, None)
             return ProjectionReceipt(
                 record_id=request.record_id,
@@ -607,6 +618,49 @@ class ShardManager(IEngine):
     # -------------------------------------------------------------------------
     # Snapshot Activation (IEngine Interface)
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _activation_journal(target_path: Path) -> Path:
+        return target_path.with_name(f".{target_path.name}.activation.json")
+
+    def _recover_activation(self, target_path: Path) -> None:
+        """Reconcile an interrupted directory switch with B's durable receipt."""
+        journal = self._activation_journal(target_path)
+        if not journal.exists():
+            return
+        entry = json.loads(journal.read_text(encoding="utf-8"))
+        backup = target_path.with_name(entry["backup_name"])
+        if self.snapshot_is_installed and self.snapshot_is_installed(entry["snapshot_id"]):
+            if not target_path.exists():
+                raise RuntimeError("Installed snapshot missing after interrupted activation")
+            if backup.exists():
+                shutil.rmtree(backup)
+        else:
+            # Without a durable B receipt, the previous base is authoritative.
+            if backup.exists():
+                if target_path.exists():
+                    shutil.rmtree(target_path)
+                backup.rename(target_path)
+            elif not entry["had_base"] and target_path.exists():
+                shutil.rmtree(target_path)
+            elif entry["had_base"] and not target_path.exists():
+                raise RuntimeError("Both active shard and recovery backup are missing")
+        journal.unlink()
+
+    def finalize_snapshot(self, shard_id: str, snapshot_id: str) -> None:
+        """Remove rollback files only after B commits the installed receipt."""
+        with self._lock:
+            target = Path(self._registration(shard_id).path)
+            journal = self._activation_journal(target)
+            if not journal.exists():
+                return
+            entry = json.loads(journal.read_text(encoding="utf-8"))
+            if entry["snapshot_id"] != snapshot_id:
+                raise ValueError("Snapshot finalization ID does not match activation")
+            backup = target.with_name(entry["backup_name"])
+            if backup.exists():
+                shutil.rmtree(backup)
+            journal.unlink()
 
     def activate_snapshot(self, candidate: SnapshotCandidate) -> ActivationReceipt:
         """Validate candidate and safely activate it with full rollback protection."""
@@ -652,13 +706,37 @@ class ShardManager(IEngine):
             temp_unpack.mkdir(parents=True, exist_ok=True)
 
             try:
-                with tarfile.open(candidate_path, "r:*") as tar:
-                    for member in tar.getmembers():
-                        # Path traversal guard
-                        target_member_path = (temp_unpack / member.name).resolve()
-                        if not str(target_member_path).startswith(str(temp_unpack.resolve())):
-                            raise SecurityError(f"Path traversal detected in snapshot archive: {member.name}")
-                    tar.extractall(path=temp_unpack)
+                if candidate.archive_format == "qdrant":
+                    # Server snapshots have their own format; let the Edge SDK
+                    # validate and unpack it instead of treating it as a tarball.
+                    self.shard_store.unpack_snapshot(candidate_path, temp_unpack)
+                elif candidate.archive_format == "tar":
+                    # A checksum authenticates bytes, not member paths or types.
+                    max_unpacked_bytes = 1024 * 1024 * 1024
+                    total_unpacked = 0
+                    with tarfile.open(candidate_path, "r:*") as tar:
+                        for member in tar:
+                            destination = temp_unpack / member.name
+                            if (not member.name or Path(member.name).is_absolute()
+                                    or any(part == ".." for part in Path(member.name).parts)
+                                    or not destination.resolve().is_relative_to(temp_unpack.resolve())):
+                                raise ValueError(f"Unsafe snapshot path: {member.name}")
+                            if not (member.isfile() or member.isdir()):
+                                raise ValueError(f"Unsupported snapshot member: {member.name}")
+                            total_unpacked += member.size
+                            if total_unpacked > max_unpacked_bytes:
+                                raise ValueError("Snapshot exceeds unpacked-size limit")
+                            if member.isdir():
+                                destination.mkdir(parents=True, exist_ok=True)
+                            else:
+                                destination.parent.mkdir(parents=True, exist_ok=True)
+                                source = tar.extractfile(member)
+                                if source is None:
+                                    raise ValueError(f"Missing snapshot member: {member.name}")
+                                with source, destination.open("wb") as output:
+                                    shutil.copyfileobj(source, output)
+                else:
+                    raise ValueError(f"Unsupported snapshot format: {candidate.archive_format}")
 
                 # Validate unpack contains valid Qdrant Edge shard files
                 test_shard = self.shard_store.load(str(temp_unpack))
@@ -681,7 +759,18 @@ class ShardManager(IEngine):
 
             # 4. Safe atomic replacement with rollback backup
             target_path = Path(reg.path)
-            backup_path = target_path.parent / f"backup_{shard_id}_{int(time.time())}"
+            journal = self._activation_journal(target_path)
+            if journal.exists():
+                return ActivationReceipt(snapshot_id=candidate.snapshot_id, shard_id=shard_id,
+                                         success=False, error="Previous activation has not been reconciled")
+            backup_path = target_path.with_name(f".{target_path.name}.backup.{uuid.uuid4().hex}")
+            journal_entry = {"snapshot_id": candidate.snapshot_id,
+                             "backup_name": backup_path.name, "had_base": target_path.exists()}
+
+            with journal.open("x", encoding="utf-8") as f:
+                json.dump(journal_entry, f)
+                f.flush()
+                os.fsync(f.fileno())
 
             was_loaded = shard_id in self._loaded
             if was_loaded:
@@ -699,9 +788,7 @@ class ShardManager(IEngine):
                 reg.installed_version = candidate.manifest_version
                 reg.state = ShardLifecycleState.LOADED
 
-                # Cleanup backup
-                if backup_path.exists():
-                    shutil.rmtree(backup_path, ignore_errors=True)
+                # Keep the old base until B has durably recorded this receipt.
 
                 self._emit_event(
                     "shard_activated",
@@ -730,6 +817,7 @@ class ShardManager(IEngine):
                         reg.state = ShardLifecycleState.LOADED
                     except Exception:
                         reg.state = ShardLifecycleState.FAILED
+                journal.unlink(missing_ok=True)
 
                 return ActivationReceipt(
                     snapshot_id=candidate.snapshot_id,
@@ -765,13 +853,14 @@ class ShardManager(IEngine):
     def close_all(self) -> None:
         with self._lock:
             self._accepting_work = False
-            # Wait for in-flight operations to drain (bounded wait)
-            drain_start = time.time()
+            # A timeout cannot justify closing a handle still held by a reader.
+            # Leave it open and report the incomplete shutdown to the caller.
+            drain_deadline = time.monotonic() + 3.0
             while any(reg.active_operations > 0 for reg in self._registrations.values()):
-                if time.time() - drain_start > 3.0:
-                    logger.warning("Timed out waiting for active operations to drain; forcing shutdown")
-                    break
-                self._queue_condition.wait(timeout=0.1)
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Active shard operations did not drain; handles remain open")
+                self._queue_condition.wait(timeout=min(0.1, remaining))
 
             for shard_id in list(self._loaded):
                 try:

@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from shared.contracts import (
     PriorityLevel,
@@ -167,9 +167,31 @@ class SQLiteMemoryStore:
                         last_error TEXT,
                         created_at TEXT NOT NULL,
                         status TEXT NOT NULL DEFAULT 'pending',
-                        UNIQUE(record_id, version)
+                        UNIQUE(operation_id)
                     );
                 """)
+                # Older databases keyed pending work by (record_id, version), which
+                # silently replaced one branch of a concurrent edit. Preserve all
+                # queued operations when migrating that schema.
+                table_sql = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='projection_pending'"
+                ).fetchone()[0]
+                if "UNIQUE(record_id, version)" in table_sql:
+                    conn.execute("ALTER TABLE projection_pending RENAME TO projection_pending_old")
+                    conn.execute("""CREATE TABLE projection_pending (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        record_id TEXT NOT NULL, operation_id TEXT NOT NULL UNIQUE,
+                        version INTEGER NOT NULL, context_id TEXT NOT NULL,
+                        is_tombstone INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
+                    )""")
+                    conn.execute("""INSERT INTO projection_pending
+                        (id, record_id, operation_id, version, context_id, is_tombstone,
+                         attempts, last_error, created_at, status)
+                        SELECT id, record_id, operation_id, version, context_id, is_tombstone,
+                               attempts, last_error, created_at, status
+                        FROM projection_pending_old""")
+                    conn.execute("DROP TABLE projection_pending_old")
 
                 # 6. Upload Outbox (for Server Sync)
                 conn.execute("""
@@ -376,6 +398,11 @@ class SQLiteMemoryStore:
                 if is_contested and existing_record:
                     # Record the conflict
                     conflict_id = f"conf_{record.record_id}_{record.operation_id}"
+                    competing = conn.execute(
+                        "SELECT operation_id FROM operations_log WHERE record_id = ? "
+                        "AND operation_id != ? ORDER BY rowid DESC LIMIT 1",
+                        (record.record_id, record.operation_id),
+                    ).fetchone()
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO conflict_records (
@@ -389,7 +416,7 @@ class SQLiteMemoryStore:
                             record.operation_id,
                             version_to_set,
                             record.parent_version,
-                            existing_record["device_id"],
+                            competing["operation_id"] if competing else record.operation_id,
                             json.dumps(record.observation),
                             datetime.now(timezone.utc).isoformat(),
                         ),
@@ -462,7 +489,7 @@ class SQLiteMemoryStore:
                 # 7. Projection-Pending Work
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO projection_pending (
+                    INSERT OR IGNORE INTO projection_pending (
                         record_id, operation_id, version, context_id, is_tombstone, created_at, status
                     ) VALUES (?, ?, ?, ?, ?, ?, 'pending');
                     """,
@@ -511,14 +538,16 @@ class SQLiteMemoryStore:
             finally:
                 conn.close()
 
-    def mark_projection_completed(self, record_id: str, version: int) -> None:
+    def mark_projection_completed(self, record_id: str, version: int,
+                                  operation_id: Optional[str] = None) -> None:
         with self._lock:
             conn = self._get_connection()
             try:
-                conn.execute(
-                    "DELETE FROM projection_pending WHERE record_id = ? AND version <= ?;",
-                    (record_id, version),
-                )
+                if operation_id:
+                    conn.execute("DELETE FROM projection_pending WHERE operation_id = ?", (operation_id,))
+                else:
+                    conn.execute("DELETE FROM projection_pending WHERE record_id = ? AND version <= ?",
+                                 (record_id, version))
             finally:
                 conn.close()
 
@@ -660,6 +689,7 @@ class SQLiteMemoryStore:
                 urgent_queued = conn.execute("SELECT COUNT(*) as c FROM outbox WHERE status = 'queued' AND priority = 'urgent';").fetchone()["c"]
                 conflicts_count = conn.execute("SELECT COUNT(*) as c FROM conflict_records WHERE status = 'contested';").fetchone()["c"]
                 proj_backlog = conn.execute("SELECT COUNT(*) as c FROM projection_pending WHERE status = 'pending';").fetchone()["c"]
+                local_only = conn.execute("SELECT COUNT(*) as c FROM current_records WHERE sharing = 'LOCAL_ONLY';").fetchone()["c"]
                 return {
                     "outbox_queued": queued,
                     "outbox_sent": sent,
@@ -667,6 +697,22 @@ class SQLiteMemoryStore:
                     "urgent_queued": urgent_queued,
                     "conflicts_count": conflicts_count,
                     "projection_backlog": proj_backlog,
+                    "local_only": local_only,
+                    "queued": queued,
+                    "queued_uploads": queued,
+                    "sent": sent,
+                    "acknowledged": acked,
+                    "acked": acked,
+                    "urgent_queue": urgent_queued,
+                    "urgent": urgent_queued,
+                    "queue": {
+                        "queued": queued,
+                        "sent": sent,
+                        "acknowledged": acked,
+                        "projection_backlog": proj_backlog,
+                        "urgent": urgent_queued,
+                        "local_only": local_only,
+                    },
                     "approx_durable_bytes": self.get_approximate_usage_bytes(),
                     "max_durable_bytes": self.max_durable_bytes,
                 }
@@ -735,6 +781,49 @@ class SQLiteMemoryStore:
             try:
                 rows = conn.execute("SELECT record_id, version FROM installed_revisions;").fetchall()
                 return {(r["record_id"], r["version"]) for r in rows}
+            finally:
+                conn.close()
+
+    def is_snapshot_installed(self, snapshot_id: str) -> bool:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                return conn.execute("SELECT 1 FROM installed_snapshots WHERE snapshot_id = ?",
+                                    (snapshot_id,)).fetchone() is not None
+            finally:
+                conn.close()
+
+    def get_operation_ids(self, record_id: str) -> List[str]:
+        """Return immutable revision identities for projection deletion."""
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT operation_id FROM operations_log WHERE record_id = ?;", (record_id,)
+                ).fetchall()
+                return [row["operation_id"] for row in rows]
+            finally:
+                conn.close()
+
+    def get_operation(self, operation_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                row = conn.execute("SELECT * FROM operations_log WHERE operation_id = ?",
+                                   (operation_id,)).fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def get_active_conflict_operation_ids(self, record_id: str) -> Set[str]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT operation_id, competing_operation_id FROM conflict_records "
+                    "WHERE record_id = ? AND status = 'contested'", (record_id,)
+                ).fetchall()
+                return {op for row in rows for op in row if op}
             finally:
                 conn.close()
 

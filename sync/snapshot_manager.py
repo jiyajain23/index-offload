@@ -31,6 +31,7 @@ class SnapshotManager:
         network_controller: Optional[NetworkFaultController] = None,
         events: Optional[EventBus] = None,
         custom_client: Optional[httpx.Client] = None,
+        max_archive_bytes: int = 1024 * 1024 * 1024,
     ):
         self.store = store
         self.engine = engine
@@ -40,6 +41,7 @@ class SnapshotManager:
         self.network_controller = network_controller
         self.events = events
         self._custom_client = custom_client
+        self.max_archive_bytes = max_archive_bytes
 
     def _get_http_client(self) -> httpx.Client:
         if self._custom_client is not None:
@@ -68,15 +70,24 @@ class SnapshotManager:
             candidate = SnapshotCandidate(**metadata)
 
             # 2. Download Snapshot Archive into Staging Directory with Bounded Streaming & Checksum
-            stage_archive_path = self.staging_dir / f"{candidate.snapshot_id}.tar"
+            # Never allow server-provided IDs to choose a filesystem path.
+            import uuid
+            stage_archive_path = self.staging_dir / f"stage_{uuid.uuid4().hex}.tar"
             hasher = hashlib.sha256()
-
-            with client.stream("GET", f"{self.server_url}/api/v1/snapshots/{context_id}/download") as stream:
-                stream.raise_for_status()
-                with open(stage_archive_path, "wb") as f:
-                    for chunk in stream.iter_bytes(chunk_size=65536):
-                        f.write(chunk)
-                        hasher.update(chunk)
+            try:
+                total_bytes = 0
+                with client.stream("GET", f"{self.server_url}/api/v1/snapshots/{context_id}/download") as stream:
+                    stream.raise_for_status()
+                    with open(stage_archive_path, "wb") as f:
+                        for chunk in stream.iter_bytes(chunk_size=65536):
+                            total_bytes += len(chunk)
+                            if total_bytes > self.max_archive_bytes:
+                                raise ValueError("Snapshot download exceeds size limit")
+                            f.write(chunk)
+                            hasher.update(chunk)
+            except Exception:
+                stage_archive_path.unlink(missing_ok=True)
+                raise
 
             computed_sha = hasher.hexdigest()
             if computed_sha != candidate.checksum_sha256:
@@ -102,6 +113,7 @@ class SnapshotManager:
                 manifest_version=candidate.manifest_version,
                 installed_records=candidate.included_records,
             )
+            self.engine.finalize_snapshot(candidate.target_shard_id, candidate.snapshot_id)
 
             # Emit typed event
             if self.events:

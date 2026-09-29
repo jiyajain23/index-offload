@@ -1,189 +1,212 @@
-# LIFELINE: Offline-First Memory & Resource Control System
+# LIFELINE: Offline-First Edge Memory & Vector Retrieval Platform
 
-LIFELINE is an offline-first memory and retrieval management system for inspection robotics and rugged mobile devices operating under strict hardware constraints (RAM and CPU).
+**LIFELINE** is an offline-first inspection memory and retrieval management system built for inspection robotics and rugged mobile edge devices operating under strict hardware constraints (RAM, CPU, and intermittent connectivity).
 
-The edge device keeps a detector model running without dropping frames, records observations while offline, preserves accepted writes across crashes and restarts, queries pinned emergency procedures and local context shards, uploads records when network connectivity returns, and safely stages and activates server-prepared vector index updates.
+The system enables an edge device to run real-time perception models without dropping frames, record observations durably while disconnected, execute low-latency vector searches over local procedure shards, and safely synchronize with an upstream ingestion server and **Qdrant Cloud** when network connectivity is restored.
 
 ---
 
-## 1. Supported Runtimes & Dependency Baseline
+## 1. System Architecture
 
-The implementation pins the tested baseline in `requirements.txt`:
+LIFELINE is composed of three synchronized tiers:
 
-```text
-qdrant-edge-py==0.8.0
-qdrant-client==1.19.1
-numpy>=2.0.0
-psutil>=7.0.0
-pytest>=9.0.0
-fastapi>=0.140.0
-pydantic>=2.10.0
-uvicorn>=0.30.0
-httpx>=0.28.0
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│               LIFELINE Modern Operations Dashboard                     │
+│    React 19 · TypeScript · TanStack Router · Tailwind CSS · Lucide     │
+│   Landing Page (/) · Console (/dashboard) · Live Telemetry · Search   │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ HTTP / JSON API (/api/v1)
+┌───────────────────────────────────▼────────────────────────────────────┐
+│                    LIFELINE Edge Device Backend                        │
+│                 FastAPI · Port 8000 · Soft Budget (400 MB)             │
+│                                                                        │
+│   ┌─────────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│   │   Person A: Engine  │  │  Person B: Store │  │   Person C: Det  │  │
+│   │  • ShardManager     │  │  • SQLite Memory │  │  • BeaconRunner  │  │
+│   │  • LRU Eviction     │  │  • Revision Log  │  │  • TelemetryHub  │  │
+│   │  • Reader Leases    │  │  • Urgent Outbox │  │  • Frame Ingest  │  │
+│   │  • local_write Shard│  │  • Privacy Rules │  │  • FPS/p95 Stats │  │
+│   └──────────┬──────────┘  └────────┬─────────┘  └────────┬─────────┘  │
+│              │                      │                     │            │
+│              ▼                      ▼                     ▼            │
+│       Qdrant Edge Shards      SQLite Database      Inspection Camera   │
+│       (Embedded On-Disk)     (Authoritative DB)     (Video Stream)     │
+└─────────────────────────────────────┬──────────────────────────────────┘
+                                      │ Outbox Uploads & Snapshot Handoff
+┌─────────────────────────────────────▼──────────────────────────────────┐
+│                   Upstream Ingestion Server                            │
+│                 FastAPI · Port 8001 · ServerStore                      │
+│                                                                        │
+│   ┌────────────────────────────────────────────────────────────────┐   │
+│   │              Qdrant Cloud Server Index Preparer                │   │
+│   │  • Dense + Sparse Vector Indexing (minilm-l6-v2)               │   │
+│   │  • Optimizes collections and exports Shard Snapshots           │   │
+│   └───────────────────────────────┬────────────────────────────────┘   │
+└───────────────────────────────────┼────────────────────────────────────┘
+                                    │ QDRANT_URL + QDRANT_API_KEY
+┌───────────────────────────────────▼────────────────────────────────────┐
+│                      Qdrant Cloud Cluster                              │
+│   Managed Vector Database · Dense & Sparse Vectors · Snapshots Export │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-Supported Environments:
-- **Operating Systems**: Linux (cgroup v2), Windows 10/11 (PowerShell, `py` launcher, local process fallback), and WSL2.
-- **Python Runtime**: Python 3.10 through 3.14 (Tested on Python 3.14.6 AMD64).
-- **Qdrant Edge Baseline**: `qdrant-edge-py 0.8.0` with standard `.tar` archive unpacking.
+---
+
+## 2. Core Functional Pillars
+
+### 2.1 Person A: Edge Engine & Resource Control (`engine/`)
+* **Bounded Working-Set Budget**: Enforces a strict soft memory cap (e.g. 400 MB) via `engine/monitor.py` (supporting Linux cgroup v2 with local process RSS fallback).
+* **Deterministic LRU Eviction**: Unloads inactive context shards when memory pressure rises, with cooldown and hysteresis guards to eliminate thrashing.
+* **Reader Leases (`lease_shard`)**: Guarantees active search queries complete safely without handles being evicted or replaced mid-operation.
+* **Dedicated Shard Roles**:
+  * `local_write`: Dedicated non-evictable mutable projection shard for local observations.
+  * Pinned Procedures: Critical emergency response cards (`emergency_protocols`) remain loaded in memory at all times.
+  * On-Demand Contexts: Sharded spatial/zone indexes (`zone_01`, `zone_02`) loaded dynamically.
+
+### 2.2 Person B: Authoritative Durable Memory & Sync (`memory/`, `sync/`)
+* **SQLite Authority**: Every write, revision, and tombstone is committed durably to SQLite before updating vector search projections.
+* **Revision & Conflict Tracking**: Preserves competing concurrent operations under network partitioning. Identifies contested revisions for operator review without silent overwrites.
+* **Privacy Enforcement**: Observations marked `LOCAL_ONLY` are strictly preserved on the edge and filtered out of upload batches.
+* **Urgent Outbox Worker**: Upload worker prioritizes emergency/hazard records ahead of routine telemetry batches.
+* **Atomic Snapshot Activation**: Downloads server-prepared Qdrant snapshots, verifies SHA-256 checksums in staging, hands handles to the Engine, and maintains durable journals for crash rollback.
+
+### 2.3 Person C: Perception & Telemetry Boundary (`perception/`, `app/telemetry.py`)
+* **Bounded Perception Runner**: Background OpenCV beacon detector analyzing inspection feeds without blocking the search engine.
+* **Contention Monitoring**: Thread-safe sliding-window telemetry hub measuring FPS, p50/p95/p99 inference latency, dropped frames, and queue depths.
+* **Deterministic Labelling**: Clearly marks synthetic vs live observations to ensure test fixtures are never misrepresented as operational hardware results.
+
+### 2.4 Modern Frontend Operations Console (`frontend/`)
+* **Stack**: Built with React 19, TypeScript, TanStack Router & Start, Tailwind CSS, Lucide icons, and Radix UI components.
+* **Views**:
+  * **Landing Page (`/`)**: Product showcase and architectural specification.
+  * **Operations Dashboard (`/dashboard`)**: Live topology status, perception frame inspector, memory search with coverage breakdowns, shard inventory, outbox queue gauges, conflict comparison, and network fault injection drills.
 
 ---
 
-## 2. Architecture & Ownership Boundaries
+## 3. Quickstart & Local Execution
 
-- **Person A (Engine)**: Shard registry, active-operation leases (`lease_shard`), soft working-set budget enforcement, LRU eviction with cooldown/hysteresis, dedicated non-evictable `local_write` shard, pinned protocol shards, bounded query queue, cross-shard ranking, and atomic snapshot activation with rollback.
-- **Person B (Durable Memory & Sync)**: SQLite transactional persistence, revision/conflict semantics, urgent storage reserve protection, privacy filters (`LOCAL_ONLY` records never leave edge), public search reconciliation (tombstones, supersedes, refill), server ingestion deduplication, urgent-priority upload worker, and server snapshot staging.
-- **Person C (Boundary & Telemetry)**: Fast HTTP endpoints, detector telemetry ingestion, sliding-percentile contention tracking, and deterministic contention stubs (`is_synthetic=True`).
+### Prerequisites
+* **Python**: 3.10 to 3.14 (Python 3.14 tested)
+* **Node.js**: v20+ with `npm`
 
-For complete architecture details and data flows, see [docs/architecture.md](docs/architecture.md).  
-For client integration instructions and examples, see [docs/person_c_guide.md](docs/person_c_guide.md).
+### 1. Configure Environment (`.env`)
+Copy [`.env.example`](.env.example) to `.env`:
+```bash
+cp .env.example .env
+```
+Fill in your Qdrant Cloud details:
+```env
+QDRANT_URL=https://745e9348-4852-4130-aeff-39b7dae841d5.australia-southeast1-0.gcp.cloud.qdrant.io
+QDRANT_API_KEY=your_qdrant_api_key_here
+LIFELINE_DEMO=1
+```
 
----
-
-## 3. Quickstart & Local Startup
-
-### 3.1 Local Environment Setup
-
-```powershell
-# 1. Install dependencies
+### 2. Install Dependencies
+```bash
+# Backend dependencies
 py -m pip install -r requirements.txt
 
-# 2. Run test suite to verify installation
+# Frontend dependencies
+cd frontend
+npm install
+cd ..
+```
+
+### 3. Run the Platform
+
+#### Option A: One-Command Launcher (Recommended)
+```bash
+# Windows
+dev.bat
+
+# Or Python runner
+py run_fullstack.py --dev
+```
+
+#### Option B: Dedicated Terminals
+**Terminal 1 — Edge Backend:**
+```bash
+py -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 — Ingestion Server:**
+```bash
+py -m uvicorn server.server:app --host 0.0.0.0 --port 8001
+```
+
+**Terminal 3 — Frontend Dev Server:**
+```bash
+cd frontend
+npm run dev
+```
+
+---
+
+## 4. Web URLs & Access Points
+
+| Service | Address | Description |
+|---|---|---|
+| **Operations Dashboard** | [http://localhost:8000/dashboard](http://localhost:8000/dashboard) | Main real-time operational inspection console |
+| **Vite Dev Server** | [http://localhost:5173/dashboard](http://localhost:5173/dashboard) | Dev server with Hot Module Replacement |
+| **Public Landing Page** | [http://localhost:8000/](http://localhost:8000/) | Product landing page |
+| **Edge API Explorer** | [http://localhost:8000/docs](http://localhost:8000/docs) | Swagger UI for Edge device endpoints |
+| **Ingestion Server Health** | [http://localhost:8001/health](http://localhost:8001/health) | Sync server & Qdrant Cloud connection state |
+
+---
+
+## 5. API Endpoint Reference
+
+### Edge API (`:8000/api/v1`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/engine/status` | Engine working set memory, budget, active leases, and loaded shards |
+| `GET` | `/sync/status` | Outbox counts (queued, sent, acknowledged), urgent queue, local-only counts |
+| `POST` | `/sync/trigger` | Triggers immediate outbox batch processing |
+| `GET` | `/telemetry/detector` | Detector identity, FPS rate, and p95 latency |
+| `GET` | `/perception/status` | Processed frame counter, drop rate, queue depth, latest observation |
+| `GET` | `/perception/frame` | Latest processed JPEG frame (with synthetic fallback SVG) |
+| `GET` | `/events?limit=30` | Recent event timeline and resident shard inventory |
+| `GET` | `/shards` | Direct list of registered shards and residency states |
+| `GET` | `/conflicts` | Contested alternative revisions grouped with review metadata |
+| `POST` | `/conflicts/resolve` | Resolves competing operations with a superseding record |
+| `POST` | `/search/text` | Hybrid search across local active contexts and emergency protocols |
+| `POST` | `/records` | Durably commits an observation record to SQLite and projects into search |
+| `GET` | `/records/{id}` | Fetches authoritative current record revision |
+| `DELETE` | `/records/{id}` | Writes a durable tombstone record |
+| `POST` | `/network/offline` | Simulates network link interruption (`{"offline": true}`) |
+| `GET` | `/network/status` | Link status and offline fault injection indicator |
+| `POST` | `/snapshots/fetch` | Downloads, unpacks, and activates a server vector snapshot |
+| `POST` | `/demo/seed` | Seeds multi-zone demonstration records and procedure cards |
+
+### Ingestion Server API (`:8001/api/v1`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/ingest` | Ingests and deduplicates outbox batches from edge devices |
+| `POST` | `/snapshots/prepare` | Indexes records in Qdrant Cloud and exports a shard snapshot |
+| `GET` | `/snapshots/latest/{context_id}` | Returns metadata for latest context snapshot |
+| `GET` | `/snapshots/download/{snapshot_id}` | Streams prepared snapshot archive to edge device |
+| `GET` | `/health` | Ingestion service status and Qdrant Cloud connectivity |
+
+---
+
+## 6. Testing & Quality Assurance
+
+LIFELINE includes an exhaustive test suite covering Qdrant Edge adapter integration, resource monitor accounting, shard leasing, crash recovery, outbox sync, and public API contracts:
+
+```bash
+# Run backend test suite
 py -m pytest -v
-```
 
-### 3.2 Launching the Edge Backend
-
-Start the LIFELINE Edge FastAPI server locally:
-
-```powershell
-py -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The service initializes:
-- SQLite durable database at `./data/edge_memory.db`
-- Dedicated mutable projection shard at `./data/shards/local_write`
-- Default procedure cards and multi-zone seed fixtures
-- Event bus and background sync workers
-
-### 3.3 Running in Docker (512MB Capped Edge Environment)
-
-Build the edge image:
-
-```powershell
-docker build -t lifeline-edge .
-```
-
-Run with a 512 MB memory limit and swap disabled to simulate rugged edge constraints:
-
-```powershell
-docker run --rm --name lifeline-device `
-  --memory=512m --memory-swap=512m `
-  -p 8000:8000 `
-  lifeline-edge
+# Run production frontend build
+cd frontend
+npm run build
 ```
 
 ---
 
-## 4. Edge Resource Limits & Server Separation
+## 7. License
 
-### Edge Resource Accounting
-The edge device monitors memory via `engine/monitor.py`:
-- **cgroup v2**: Reads `/sys/fs/cgroup/memory.current`, `memory.stat` (`inactive_file`), and `memory.events`. The edge working set is computed as `memory.current - inactive_file`.
-- **Local Fallback**: On Windows/non-cgroup systems, uses `psutil.Process().memory_info().rss` and working set. All telemetry explicitly reports `source="cgroup_v2"` or `source="local_process"`.
-
-### Soft Budget & Eviction Policy
-- **Pinned Shards & `local_write`**: Non-evictable. Guaranteed to remain loaded in memory.
-- **On-Demand Context Shards**: Evicted using deterministic LRU order when projected load exceeds `soft_budget_mb`.
-- **Hysteresis & Cooldown**: Eviction triggers a cooldown timer and recovery band, preventing thrashing under rapid context switching.
-- **Bounded Query Admission**: Queries waiting on busy handles enter a bounded queue (`max_queue_depth=50`) with deadline awareness (`deadline_ms`).
-
-### Server Separation
-The LIFELINE Server runs as an independent service outside the edge device's memory and CPU budget. Heavy operations—such as multi-point indexing and `shard.optimize()`—are executed strictly on the server during snapshot compilation, never on the constrained edge device.
-
----
-
-## 5. Offline Fault Control & Sync
-
-LIFELINE includes a transport-level network fault controller (`engine/network_control.py`) to simulate connectivity drops without modifying host networking:
-
-```python
-import httpx
-
-# 1. Simulate entering a network-dead zone
-httpx.post("http://localhost:8000/api/v1/dev/network", json={"offline": True})
-
-# 2. Writes continue normally and durably offline
-# Permitted and local-only records are accepted into SQLite
-
-# 3. Restore connectivity
-httpx.post("http://localhost:8000/api/v1/dev/network", json={"offline": False})
-
-# 4. Trigger sync flush
-httpx.post("http://localhost:8000/api/v1/sync/trigger")
-```
-
----
-
-## 6. Running Tests
-
-Run the complete test suite:
-
-```powershell
-py -m pytest -v
-```
-
-### Test Coverage Highlights:
-- `tests/test_engine_advanced.py`: Concurrency safety (active operation leases protect readers from eviction), startup configuration checks, queue bounds, deadline enforcement, cross-shard ranking, version guards, and safe snapshot activation with checksum verification and rollback.
-- `tests/test_memory_advanced.py`: Transactional durability across restarts, crash recovery between commit and projection, idempotency, concurrent conflict flagging, explicit conflict resolution, tombstone exclusions, privacy guarantees (`LOCAL_ONLY` outbox exclusion), urgent reserve capacity, and event bus error isolation.
-- `tests/test_sync_and_server.py`: Server ingestion deduplication, urgent-first outbox worker with jittered backoff, server index compilation, and atomic snapshot download/activation.
-- `tests/test_smoke_scenario.py`: 15-step end-to-end integration test exercising edge persistence, real offline transport breakage, urgent outbox prioritization, server preparation, concurrent edit survival, and privacy verification.
-
----
-
-## 7. Running Reproducible Benchmarks
-
-Execute the benchmark suite comparing **Naive full-load**, **Tuned on-disk unmanaged**, and **Managed ShardManager** under concurrent detector contention:
-
-```powershell
-py benchmark/runner.py --queries 40 --shards 8 --points 500 --dim 64 --budget-mb 250
-```
-
-Results are saved to `benchmark/results.csv` and `benchmark/results.json`.
-
-### Measured Benchmark Results (Summary)
-
-*Hold-Constant: seed=42, 64-dim, 8 shards, 500 pts/shard, 30 FPS synthetic detector contention stub.*
-
-| Mode | Search P95 Latency | Queue P95 Time | Detector Contention FPS | Exact Recall | Relevant Shard Coverage | Peak RSS | Architectural Characteristics |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Naive** | 191.19 ms | 0.00 ms | 15.0 fps | 1.000 (100%) | 100.0% | 261.5 MB | Eagerly loads all shards; high memory footprint, degrades detector frame rate. |
-| **Unmanaged** | 166.24 ms | 0.00 ms | 12.3 fps | 1.000 (100%) | 100.0% | 81.0 MB | Opens/closes shard per query; causes severe disk I/O churn that starves detector. |
-| **Managed** | **100.17 ms** | **0.11 ms** | **21.0 fps** | **1.000 (100%)** | **100.0%** | **226.4 MB** | **LRU retention + active leases + soft budget; achieves fastest latency and highest FPS.** |
-
----
-
-## 8. Projection Rebuild & Snapshot Recovery
-
-### Rebuilding Projections from Authoritative SQLite State
-The SQLite database (`SQLiteMemoryStore`) is the authoritative source of truth. If the Qdrant Edge shard files become corrupted or are deleted:
-```python
-from memory.service import MemoryService
-# Replay all pending or current records from SQLite into ShardManager
-replayed = memory_service.replay_pending_projections()
-print(f"Rebuilt {replayed} projected records into search index.")
-```
-
-### Snapshot Compatibility & Atomic Rollback
-- Server snapshots are packaged as `.tar` archives containing a full `EdgeShard` index created with `EdgeConfig(vectors={"embedding": ...})`.
-- Before activating a snapshot, `ShardManager` validates the archive's SHA256 checksum and extracts it to a temporary staging folder with path traversal guards.
-- The active shard directory is backed up before swap. If loading the new shard fails, `ShardManager` immediately restores the previous base from backup and reports `reverted_to_previous=True`.
-
----
-
-## 9. Known Limitations & Constraints
-
-1. **Docker Cgroup on Windows Host**: Running native Windows Python relies on `psutil` process working-set metrics because `/sys/fs/cgroup` is only present in Linux/container environments. Production deployments should run in the provided Linux container.
-2. **Qdrant Edge In-Process Snapshots**: In `qdrant-client`, local in-process snapshot creation (`create_snapshot`) is unsupported by the C-core binding. LIFELINE solves this by building and optimizing server snapshots using real `EdgeShard.create` outside the edge budget.
-3. **Sparse Vector Hardware**: Sparse vector inference requires compatible sparse embedding models. When sparse vectors are not provided, LIFELINE gracefully operates in dense-only retrieval mode.
-4. **Real Perception Telemetry**: Detector frame metrics currently default to the deterministic contention stub (`DeterministicDetectorStub`) labeled `is_synthetic=True` until Person C connects a live hardware camera and inference engine.
+Internal inspection robotics software. All rights reserved.

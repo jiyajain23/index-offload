@@ -263,6 +263,7 @@ class WriteReceipt(BaseModel):
 
 class ProjectionUpsertRequest(BaseModel):
     record_id: str
+    operation_id: Optional[str] = None  # Immutable revision identity; required for new writes.
     version: int
     context_id: str
     dense_vector: Optional[List[float]] = None
@@ -275,6 +276,7 @@ class ProjectionDeleteRequest(BaseModel):
     record_id: str
     version: Optional[int] = None
     context_id: str
+    operation_ids: List[str] = Field(default_factory=list)
 
 
 class ProjectionReceipt(BaseModel):
@@ -295,6 +297,7 @@ class SnapshotCandidate(BaseModel):
     schema_version: str = "v1"
     embedding_model_version: str = "minilm-l6-v2"
     checksum_sha256: str
+    archive_format: str = "tar"  # tar: legacy demo; qdrant: actual Server shard snapshot
     expected_files: List[str] = Field(default_factory=list)
     record_count: int = 0
     included_records: List[Dict[str, Any]] = Field(

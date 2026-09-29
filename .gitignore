@@ -1,8 +1,37 @@
-edge_data
-.venv
-benchmark_data
-indexing_test
-threshold_test
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# Frontend Build & Dependencies
+frontend/node_modules/
+frontend/.output/
+frontend/dist/
+frontend/.nitro/
+frontend/.wrangler/
+dashboard/node_modules/
+dashboard/dist/
+node_modules/
+dist/
+.output/
+
+# Runtime Data & Storage
+edge_data/
+server_data/
+benchmark_data/
+indexing_test/
+threshold_test/
+*.snapshot
+*.avi
+*.db
+*.db-wal
+*.db-shm
+
+# Python & Testing Caches
 __pycache__/
 *.py[cod]
 *$py.class
+.venv/
+.pytest_cache/

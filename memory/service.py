@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -71,6 +72,7 @@ class MemoryService(IMemory):
                 proj_res = self.engine.upsert_projection(
                     ProjectionUpsertRequest(
                         record_id=record.record_id,
+                        operation_id=record.operation_id,
                         version=receipt.version,
                         context_id=record.context_id,
                         dense_vector=record.dense_vector,
@@ -91,11 +93,13 @@ class MemoryService(IMemory):
                         record_id=record.record_id,
                         version=receipt.version,
                         context_id=record.context_id,
+                        operation_ids=self.store.get_operation_ids(record.record_id),
                     )
                 )
 
             if proj_res.success:
-                self.store.mark_projection_completed(record.record_id, receipt.version)
+                self.store.mark_projection_completed(record.record_id, receipt.version,
+                                                     record.operation_id)
                 receipt.projection_status = "ready"
             else:
                 receipt.projection_status = "pending"
@@ -163,7 +167,8 @@ class MemoryService(IMemory):
         engine_res = self.engine.query_shards(request)
 
         # Step 2: Reconcile candidates against SQLite authoritative state
-        reconciled_hits, dropped_count = self._reconcile_candidates(engine_res.candidates, request.context)
+        reconciled_hits, dropped_count = self._reconcile_candidates(
+            engine_res.candidates, request.context, request.filters)
 
         # Step 3: Over-fetch / refill if filtering created a shortfall and deadline allows
         if len(reconciled_hits) < request.k and dropped_count > 0:
@@ -171,7 +176,8 @@ class MemoryService(IMemory):
                 refill_k = request.k + dropped_count + 5
                 refill_req = request.model_copy(update={"k": refill_k})
                 refill_res = self.engine.query_shards(refill_req)
-                refill_hits, _ = self._reconcile_candidates(refill_res.candidates, request.context)
+                refill_hits, _ = self._reconcile_candidates(
+                    refill_res.candidates, request.context, request.filters)
                 reconciled_hits = refill_hits
 
         final_hits = reconciled_hits[:request.k]
@@ -195,7 +201,7 @@ class MemoryService(IMemory):
         )
 
     def _reconcile_candidates(
-        self, candidates: List[CandidateHit], target_context: str
+        self, candidates: List[CandidateHit], target_context: str, filters=None
     ) -> Tuple[List[MemorySearchHit], int]:
         valid_hits: List[MemorySearchHit] = []
         dropped_count = 0
@@ -204,8 +210,7 @@ class MemoryService(IMemory):
         for cand in candidates:
             # Point ID in Qdrant may be payload record_id or point_id
             rec_id = str(cand.payload.get("record_id", cand.point_id))
-            if rec_id in seen_records:
-                continue
+            op_id = cand.payload.get("operation_id")
 
             # Check authoritative state in SQLite
             rec = self.store.get_record(rec_id)
@@ -218,15 +223,32 @@ class MemoryService(IMemory):
 
             # Rule B: Check if superseded or current
             if rec:
+                candidate_version = int(cand.payload.get("version", 0))
+                if candidate_version != rec.version:
+                    dropped_count += 1
+                    continue
+                conflicts = self.store.get_active_conflict_operation_ids(rec_id)
+                if rec.status == RecordStatus.CONTESTED and op_id in conflicts:
+                    operation = self.store.get_operation(op_id)
+                    if operation:
+                        key = op_id
+                        if key in seen_records:
+                            continue
+                        valid_hits.append(MemorySearchHit(
+                            record_id=rec_id, version=operation["version"],
+                            entity_id=operation["entity_id"], context_id=operation["context_id"],
+                            source_shard=cand.shard_id, installed_version=cand.shard_version,
+                            score=cand.score, status=RecordStatus.CONTESTED, is_contested=True,
+                            conflict_alternatives=sorted(conflicts - {op_id}),
+                            observation=json.loads(operation["observation_json"]),
+                            observed_at=datetime.fromisoformat(operation["observed_at"]),
+                        ))
+                        seen_records.add(key)
+                        continue
+                if rec_id in seen_records:
+                    continue
                 # Local authoritative version
                 is_contested = (rec.status == RecordStatus.CONTESTED)
-                conflicts = []
-                if is_contested:
-                    conflicts = [
-                        c["operation_id"]
-                        for c in self.store.get_conflicts()
-                        if c["record_id"] == rec_id
-                    ]
 
                 valid_hits.append(
                     MemorySearchHit(
@@ -239,7 +261,7 @@ class MemoryService(IMemory):
                         score=cand.score,
                         status=rec.status,
                         is_contested=is_contested,
-                        conflict_alternatives=conflicts,
+                        conflict_alternatives=sorted(conflicts) if is_contested else [],
                         observation=rec.observation,
                         confidence=rec.confidence,
                         confidence_source=rec.confidence_source,
@@ -250,6 +272,8 @@ class MemoryService(IMemory):
                 seen_records.add(rec_id)
             else:
                 # Base shard record not yet locally modified
+                if rec_id in seen_records:
+                    continue
                 valid_hits.append(
                     MemorySearchHit(
                         record_id=rec_id,
@@ -271,9 +295,36 @@ class MemoryService(IMemory):
                 )
                 seen_records.add(rec_id)
 
+        # The Edge adapter currently does not push arbitrary payload filters into
+        # Qdrant. Enforce the public contract against authoritative data here.
+        if filters:
+            filtered = [hit for hit in valid_hits if self._matches_filters(hit, filters)]
+            dropped_count += len(valid_hits) - len(filtered)
+            valid_hits = filtered
+
         # Sort descending by score
         valid_hits.sort(key=lambda h: h.score, reverse=True)
         return valid_hits, dropped_count
+
+    @staticmethod
+    def _matches_filters(hit: MemorySearchHit, filters) -> bool:
+        def value_for(key: str):
+            if key.startswith("observation."):
+                return hit.observation.get(key[len("observation."):])
+            if key == "status":
+                return hit.status.value
+            if key in {"record_id", "entity_id", "context_id", "source_shard"}:
+                return getattr(hit, key)
+            # Unknown keys fail closed for must and must_not.
+            raise ValueError(f"Unsupported search filter: {key}")
+
+        for key, expected in (filters.must or {}).items():
+            if value_for(key) != expected:
+                return False
+        for key, forbidden in (filters.must_not or {}).items():
+            if value_for(key) == forbidden:
+                return False
+        return True
 
     # -------------------------------------------------------------------------
     # Conflict Inspection & Resolution
@@ -342,6 +393,7 @@ class MemoryService(IMemory):
                     res = self.engine.upsert_projection(
                         ProjectionUpsertRequest(
                             record_id=rec_id,
+                            operation_id=item["operation_id"],
                             version=ver,
                             context_id=ctx,
                             dense_vector=dense,
@@ -352,11 +404,14 @@ class MemoryService(IMemory):
                     )
                 else:
                     res = self.engine.delete_projection(
-                        ProjectionDeleteRequest(record_id=rec_id, version=ver, context_id=ctx)
+                        ProjectionDeleteRequest(
+                            record_id=rec_id, version=ver, context_id=ctx,
+                            operation_ids=self.store.get_operation_ids(rec_id),
+                        )
                     )
 
                 if res.success:
-                    self.store.mark_projection_completed(rec_id, ver)
+                    self.store.mark_projection_completed(rec_id, ver, item["operation_id"])
                     replayed += 1
             except Exception as e:
                 logger.warning("Replay projection failed for %s: %s", rec_id, e)

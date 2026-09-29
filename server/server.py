@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -10,7 +11,14 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from .index_prep import ServerIndexPreparer
+from .qdrant_prep import QdrantServerIndexPreparer
 from .store import ServerMemoryStore
 
 app = FastAPI(title="LIFELINE Server API", version="1.0.0")
@@ -26,7 +34,13 @@ def init_server(data_dir: Path | str = DEFAULT_SERVER_DIR) -> None:
     path = Path(data_dir)
     path.mkdir(parents=True, exist_ok=True)
     SERVER_STORE = ServerMemoryStore(path / "server_memory.db")
-    SERVER_PREPARER = ServerIndexPreparer(SERVER_STORE, output_dir=path / "snapshots")
+    qdrant_url = os.environ.get("QDRANT_URL")
+    if qdrant_url:
+        SERVER_PREPARER = QdrantServerIndexPreparer(
+            SERVER_STORE, path / "snapshots", qdrant_url,
+            api_key=os.environ.get("QDRANT_API_KEY"))
+    else:
+        SERVER_PREPARER = ServerIndexPreparer(SERVER_STORE, output_dir=path / "snapshots")
 
 
 def get_store() -> ServerMemoryStore:
@@ -41,6 +55,11 @@ def get_preparer() -> ServerIndexPreparer:
     if SERVER_PREPARER is None:
         init_server()
     return SERVER_PREPARER  # type: ignore
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "lifeline-ingestion-server", "qdrant_configured": bool(os.environ.get("QDRANT_URL"))}
 
 
 # Request/Response schemas
@@ -126,5 +145,5 @@ def download_snapshot(context_id: str):
     return FileResponse(
         path=str(archive_path),
         filename=archive_path.name,
-        media_type="application/x-tar",
+        media_type="application/octet-stream",
     )

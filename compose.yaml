@@ -1,0 +1,42 @@
+services:
+  edge:
+    build: .
+    container_name: lifeline_edge
+    environment:
+      LIFELINE_EDGE_DATA: /data
+      LIFELINE_SERVER_URL: http://server:8001
+      LIFELINE_SOFT_BUDGET_MB: "380"
+      LIFELINE_DEMO: "1"
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1.0
+    ports: ["8000:8000"]
+    volumes: ["edge_data:/data"]
+    networks: [api, sync]
+    depends_on: [server]
+
+  server:
+    build: .
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    command: ["python", "-m", "uvicorn", "server.server:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports: ["8001:8001"]
+    volumes: ["server_data:/app/server_data"]
+    networks: [sync]
+    depends_on: [qdrant]
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.3
+    volumes: ["qdrant_data:/qdrant/storage"]
+    networks: [sync]
+
+volumes:
+  edge_data:
+  server_data:
+  qdrant_data:
+
+networks:
+  api:
+  sync:
+    name: lifeline_sync
