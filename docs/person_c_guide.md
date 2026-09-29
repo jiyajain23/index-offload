@@ -1,9 +1,0 @@
-# Person C demo and integration
-
-The included demonstration uses a fixed synthetic AVI of a red status beacon. `BeaconRunner` reads frames into a two-frame bounded queue, applies an OpenCV HSV red-pixel rule, publishes real processing telemetry, and writes a local-only observation after consecutive detections. Its deterministic 384-dimensional hash embedding supports local retrieval, but is not a trained semantic model. An observation means only that a visual beacon was detected; it requires operator review.
-
-Set `LIFELINE_DEMO=1`, start the edge service, run `npm ci && npm run build` in `dashboard/`, and visit `/dashboard/`. **Seed demo data** creates labelled non-operational placeholders in the three registered demo shards. The preview, search, coverage, outbox, shard inspector, and activity timeline can be inspected there. The dashboard's link toggle calls `POST /api/v1/network/offline` for client-side fault injection. A physical transport outage requires disconnecting the Docker `lifeline_sync` network.
-
-The edge API also exposes `POST /api/v1/records` for externally supplied observations with vectors, `POST /api/v1/search` and `/api/v1/search/text`, `GET /api/v1/conflicts`, `POST /api/v1/conflicts/resolve`, `GET /api/v1/telemetry/detector`, `GET /api/v1/perception/status`, and `GET /api/v1/sync/status`. Consult `/docs` for exact request schemas. External detectors must label provenance accurately and set `sharing=local_only` for records that must remain on-device. The current implementation does not support revocation of previously queued shared records.
-
-The synthetic fixture and hash embedder serve one repeatable product demonstration. They do not establish industrial detection accuracy, GPU contention, or performance on the target device. See `IMPLEMENTATION_CHECKLIST.md` for remaining release gates.

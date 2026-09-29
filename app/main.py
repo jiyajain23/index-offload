@@ -134,13 +134,29 @@ def create_app(
     runner = None
     if demo_mode and BeaconRunner is not None:
         try:
+            initial_source = os.environ.get("LIFELINE_VIDEO_SOURCE", "fixture").strip().lower()
             fixture_path = Path("fixtures/inspection_beacon.avi")
             if not fixture_path.exists():
                 fixture_path = data_path / "inspection_beacon.avi"
             if not fixture_path.exists() and make_fixture is not None:
                 make_fixture(fixture_path)
-            if fixture_path.exists():
-                runner = BeaconRunner(fixture_path, memory_service, telemetry_hub, events=bus)
+
+            if initial_source in ("webcam", "camera", "0"):
+                runner = BeaconRunner(
+                    video_path="webcam",
+                    memory_service=memory_service,
+                    telemetry=telemetry_hub,
+                    events=bus,
+                    synthetic_input=False,
+                )
+            elif fixture_path.exists():
+                runner = BeaconRunner(
+                    video_path=fixture_path,
+                    memory_service=memory_service,
+                    telemetry=telemetry_hub,
+                    events=bus,
+                    synthetic_input=True,
+                )
         except Exception as _run_err:
             logger.warning("Could not initialize beacon runner: %s", _run_err)
 

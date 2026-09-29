@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import os
 import json
 import uuid
@@ -166,6 +166,53 @@ def perception_status():
         "metrics": {"frames": 0, "drops": 0, "depth": 0},
         "latest_observation": "Perception runner not started; idle.",
     }
+
+
+class SwitchSourceRequest(BaseModel):
+    source: str = Field(..., description="Target source: 'webcam' or 'fixture' (or camera index)")
+
+
+@router.post("/perception/source")
+def switch_perception_source(req: SwitchSourceRequest):
+    """Switch perception feed between live webcam and synthetic fixture video."""
+    if not PERCEPTION_RUNNER:
+        raise HTTPException(status_code=503, detail="Perception runner unavailable")
+
+    src = req.source.strip().lower()
+    if src in ("webcam", "camera", "live", "0"):
+        target_source: Union[str, int] = "webcam"
+        synthetic = False
+    else:
+        fixture_path = Path("fixtures/inspection_beacon.avi")
+        if not fixture_path.exists():
+            fixture_path = Path("./edge_data/inspection_beacon.avi")
+        target_source = str(fixture_path)
+        synthetic = True
+
+    try:
+        ok = PERCEPTION_RUNNER.switch_source(target_source, synthetic=synthetic)
+        return {
+            "status": "switched" if ok else "failed",
+            "source": "webcam" if not synthetic else "fixture",
+            "synthetic_input": synthetic,
+            "is_camera": not synthetic,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed switching perception source: {exc}")
+
+
+@router.get("/perception/source")
+def get_perception_source():
+    if not PERCEPTION_RUNNER:
+        return {"source": "none", "available": ["webcam", "fixture"], "is_camera": False}
+    st = PERCEPTION_RUNNER.status()
+    return {
+        "source": st.get("source", "fixture"),
+        "is_camera": st.get("is_camera", False),
+        "synthetic_input": st.get("synthetic_input", True),
+        "available": ["webcam", "fixture"],
+    }
+
 
 
 _FALLBACK_SVG = (

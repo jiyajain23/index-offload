@@ -22,7 +22,7 @@ LIFELINE is composed of three synchronized tiers:
 │                 FastAPI · Port 8000 · Soft Budget (400 MB)             │
 │                                                                        │
 │   ┌─────────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
-│   │   Person A: Engine  │  │  Person B: Store │  │   Person C: Det  │  │
+│   │    Engine           │  │  Store           │  │   Detector       │  │
 │   │  • ShardManager     │  │  • SQLite Memory │  │  • BeaconRunner  │  │
 │   │  • LRU Eviction     │  │  • Revision Log  │  │  • TelemetryHub  │  │
 │   │  • Reader Leases    │  │  • Urgent Outbox │  │  • Frame Ingest  │  │
@@ -55,7 +55,7 @@ LIFELINE is composed of three synchronized tiers:
 
 ## 2. Core Functional Pillars
 
-### 2.1 Person A: Edge Engine & Resource Control (`engine/`)
+### 2.1 Edge Engine & Resource Control (`engine/`)
 * **Bounded Working-Set Budget**: Enforces a strict soft memory cap (e.g. 400 MB) via `engine/monitor.py` (supporting Linux cgroup v2 with local process RSS fallback).
 * **Deterministic LRU Eviction**: Unloads inactive context shards when memory pressure rises, with cooldown and hysteresis guards to eliminate thrashing.
 * **Reader Leases (`lease_shard`)**: Guarantees active search queries complete safely without handles being evicted or replaced mid-operation.
@@ -64,14 +64,14 @@ LIFELINE is composed of three synchronized tiers:
   * Pinned Procedures: Critical emergency response cards (`emergency_protocols`) remain loaded in memory at all times.
   * On-Demand Contexts: Sharded spatial/zone indexes (`zone_01`, `zone_02`) loaded dynamically.
 
-### 2.2 Person B: Authoritative Durable Memory & Sync (`memory/`, `sync/`)
+### 2.2 Authoritative Durable Memory & Sync (`memory/`, `sync/`)
 * **SQLite Authority**: Every write, revision, and tombstone is committed durably to SQLite before updating vector search projections.
 * **Revision & Conflict Tracking**: Preserves competing concurrent operations under network partitioning. Identifies contested revisions for operator review without silent overwrites.
 * **Privacy Enforcement**: Observations marked `LOCAL_ONLY` are strictly preserved on the edge and filtered out of upload batches.
 * **Urgent Outbox Worker**: Upload worker prioritizes emergency/hazard records ahead of routine telemetry batches.
 * **Atomic Snapshot Activation**: Downloads server-prepared Qdrant snapshots, verifies SHA-256 checksums in staging, hands handles to the Engine, and maintains durable journals for crash rollback.
 
-### 2.3 Person C: Perception & Telemetry Boundary (`perception/`, `app/telemetry.py`)
+### 2.3 Perception & Telemetry Boundary (`perception/`, `app/telemetry.py`)
 * **Bounded Perception Runner**: Background OpenCV beacon detector analyzing inspection feeds without blocking the search engine.
 * **Contention Monitoring**: Thread-safe sliding-window telemetry hub measuring FPS, p50/p95/p99 inference latency, dropped frames, and queue depths.
 * **Deterministic Labelling**: Clearly marks synthetic vs live observations to ensure test fixtures are never misrepresented as operational hardware results.
@@ -118,7 +118,7 @@ cd ..
 #### Option A: One-Command Launcher (Recommended)
 ```bash
 # Windows
-dev.bat
+.\dev.bat
 
 # Or Python runner
 py run_fullstack.py --dev
@@ -204,6 +204,8 @@ py -m pytest -v
 cd frontend
 npm run build
 ```
+
+> **Note on Architecture Validation:** For a full breakdown of the 12 technical experiments proving the system's ability to survive hard Docker `cgroup` memory limits (512MB) and manage embedded vector shards, please read the [Architecture Validation Report](docs/VALIDATION_REPORT.md).
 
 ---
 
