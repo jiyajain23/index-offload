@@ -1,0 +1,4 @@
+mode,detector_fps,detector_p95_frame_ms,detector_is_synthetic,search_p50_latency_ms,search_p95_latency_ms,search_p99_latency_ms,queue_p95_latency_ms,mean_recall,relevant_shard_coverage_pct,failure_rate_pct,peak_rss_mb,total_loads,total_evictions,elapsed_time_s,notes
+naive,15.0,187.4,True,0.44,191.19,210.25,0.0,1.0,100.0,0.0,261.5,5,0,1.44,Naive full memory load
+unmanaged,12.3,122.93,True,147.77,166.24,173.93,0.0,1.0,100.0,0.0,81.0,30,0,4.92,Per-request disk open/close churn
+managed,21.0,98.39,True,1.02,100.17,172.31,0.11,1.0,100.0,0.0,226.4,0,5,1.1,Bounded working-set LRU + active leases
