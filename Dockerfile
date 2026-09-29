@@ -1,8 +1,8 @@
-FROM node:22-slim AS dashboard-build
+FROM node:22-slim AS frontend-build
 WORKDIR /ui
-COPY dashboard/package*.json ./
+COPY frontend/package*.json ./
 RUN npm ci --no-audit --no-fund
-COPY dashboard ./
+COPY frontend ./
 RUN npm run build
 
 FROM python:3.12-slim
@@ -21,6 +21,7 @@ COPY sync ./sync
 COPY server ./server
 COPY fixtures ./fixtures
 COPY perception ./perception
-COPY --from=dashboard-build /ui/dist ./dashboard/dist
+COPY --from=frontend-build /ui/.output ./frontend/.output
+COPY dashboard ./dashboard
 
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
