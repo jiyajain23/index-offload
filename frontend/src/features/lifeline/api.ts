@@ -7,7 +7,7 @@ export interface StatusSnapshot {
   detectorName?: string | undefined; detectorSource?: string | undefined; detectorReviewRequired?: boolean | undefined;
   isOffline?: boolean | undefined; linkState?: string | undefined; localShards?: number | undefined; serverPrepared?: number | undefined;
   queued?: number | undefined; sent?: number | undefined; acknowledged?: number | undefined; projectionBacklog?: number | undefined; urgentQueue?: number | undefined; localOnly?: number | undefined;
-  perceptionSource?: string | undefined; isCamera?: boolean | undefined;
+  perceptionSource?: string | undefined; isCamera?: boolean | undefined; remoteStream?: boolean | undefined;
 }
 export interface EventItem { id: string; at?: string | undefined; type?: string | undefined; message?: string | undefined; severity?: string | undefined }
 export interface ConflictItem { id: string; context?: string | undefined; status?: string | undefined; revisions: Array<{ id: string; source?: string | undefined; observation?: string | undefined; at?: string | undefined }> }
@@ -38,8 +38,18 @@ export const api = {
   get: (path: string, signal?: AbortSignal) => request(path, signal ? { signal } : {}),
   post: (path: string, body: unknown, signal?: AbortSignal) => request(path, { method: "POST", body: JSON.stringify(body), ...(signal ? { signal } : {}) }),
   frameUrl: () => `${BASE}/perception/frame?t=${Date.now()}`,
-  setPerceptionSource: (source: "webcam" | "fixture") => request("/perception/source", { method: "POST", body: JSON.stringify({ source }) }),
+  setPerceptionSource: (source: "webcam" | "fixture" | "remote") => request("/perception/source", { method: "POST", body: JSON.stringify({ source }) }),
+  /** Upload a single JPEG blob captured from the browser's getUserMedia stream */
+  uploadBrowserFrame: (blob: Blob): Promise<unknown> => {
+    const form = new FormData();
+    form.append("file", blob, "frame.jpg");
+    return fetch(`${BASE}/perception/frame/upload`, { method: "POST", body: form }).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} upload failed`);
+      return r.json();
+    });
+  },
 };
+
 
 export function normalizeStatus(parts: unknown[]): StatusSnapshot {
   const records = parts.map(rec);
@@ -69,7 +79,8 @@ export function normalizeStatus(parts: unknown[]): StatusSnapshot {
     urgentQueue: num(sync["urgent_queue"], sync["urgent"], sync["urgent_queued"], queue["urgent"]),
     localOnly: num(sync["local_only"], queue["local_only"]),
     perceptionSource: str(perception["source"], perception["video_source"]),
-    isCamera: bool(perception["is_camera"]) ?? (perception["source"] === "webcam"),
+    isCamera: bool(perception["is_camera"]) ?? (perception["source"] === "webcam" || perception["source"] === "remote"),
+    remoteStream: bool(perception["remote_stream"]) ?? (perception["source"] === "remote"),
   };
 }
 

@@ -8,7 +8,7 @@ import json
 import uuid
 import logging
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from shared.contracts import (
@@ -169,33 +169,40 @@ def perception_status():
 
 
 class SwitchSourceRequest(BaseModel):
-    source: str = Field(..., description="Target source: 'webcam' or 'fixture' (or camera index)")
+    source: str = Field(..., description="Target source: 'webcam', 'remote', 'fixture' (or camera index)")
 
 
 @router.post("/perception/source")
 def switch_perception_source(req: SwitchSourceRequest):
-    """Switch perception feed between live webcam and synthetic fixture video."""
+    """Switch perception feed: 'remote' = browser webcam stream, 'webcam' = local camera, 'fixture' = synthetic video."""
     if not PERCEPTION_RUNNER:
         raise HTTPException(status_code=503, detail="Perception runner unavailable")
 
     src = req.source.strip().lower()
-    if src in ("webcam", "camera", "live", "0"):
-        target_source: Union[str, int] = "webcam"
+    if src == "remote":
+        target_source: Union[str, int] = "remote"
         synthetic = False
+        source_label = "remote"
+    elif src in ("webcam", "camera", "live", "0"):
+        target_source = "webcam"
+        synthetic = False
+        source_label = "webcam"
     else:
         fixture_path = Path("fixtures/inspection_beacon.avi")
         if not fixture_path.exists():
             fixture_path = Path("./edge_data/inspection_beacon.avi")
         target_source = str(fixture_path)
         synthetic = True
+        source_label = "fixture"
 
     try:
         ok = PERCEPTION_RUNNER.switch_source(target_source, synthetic=synthetic)
         return {
             "status": "switched" if ok else "failed",
-            "source": "webcam" if not synthetic else "fixture",
+            "source": source_label,
             "synthetic_input": synthetic,
             "is_camera": not synthetic,
+            "remote_stream": source_label == "remote",
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed switching perception source: {exc}")
@@ -204,14 +211,34 @@ def switch_perception_source(req: SwitchSourceRequest):
 @router.get("/perception/source")
 def get_perception_source():
     if not PERCEPTION_RUNNER:
-        return {"source": "none", "available": ["webcam", "fixture"], "is_camera": False}
+        return {"source": "none", "available": ["remote", "webcam", "fixture"], "is_camera": False, "remote_stream": False}
     st = PERCEPTION_RUNNER.status()
     return {
         "source": st.get("source", "fixture"),
         "is_camera": st.get("is_camera", False),
         "synthetic_input": st.get("synthetic_input", True),
-        "available": ["webcam", "fixture"],
+        "remote_stream": st.get("remote_stream", False),
+        "available": ["remote", "webcam", "fixture"],
     }
+
+
+@router.post("/perception/frame/upload")
+async def upload_browser_frame(file: UploadFile = File(...)):
+    """Accept a JPEG frame from the browser's getUserMedia stream and inject into the BeaconRunner.
+    
+    This enables live webcam processing when the backend runs on a cloud server with no
+    physical camera: the browser captures frames and POSTs them here for OpenCV processing.
+    """
+    if not PERCEPTION_RUNNER:
+        raise HTTPException(status_code=503, detail="Perception runner unavailable")
+    if not getattr(PERCEPTION_RUNNER, "_remote_mode", False):
+        raise HTTPException(status_code=409, detail="Runner is not in remote-stream mode. Switch source to 'remote' first.")
+    try:
+        jpeg_bytes = await file.read()
+        accepted = PERCEPTION_RUNNER.inject_frame(jpeg_bytes)
+        return {"accepted": accepted, "queue_depth": PERCEPTION_RUNNER.frames.qsize()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Frame injection failed: {exc}")
 
 
 

@@ -1,4 +1,4 @@
-"""Bounded video capture and red-beacon detection for supported demo scenarios (Synthetic & Live Webcam)."""
+"""Bounded video capture and red-beacon detection for supported demo scenarios (Synthetic, Live Webcam, and Remote Browser Stream)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ import numpy as np
 
 from shared.contracts import PriorityLevel, RecordEnvelope, SharingPolicy
 from .embedding import MODEL_VERSION, embed
+
+# Maximum age (seconds) of a remote-injected frame before we show "waiting" overlay
+_REMOTE_FRAME_TIMEOUT = 5.0
 
 
 class BeaconRunner:
@@ -42,7 +45,7 @@ class BeaconRunner:
         self.context_id = context_id
         self.synthetic_input = synthetic_input
         self.cooldown_seconds = cooldown_seconds
-        self.frames: Queue = Queue(maxsize=2)
+        self.frames: Queue = Queue(maxsize=4)
         self.stop_signal = threading.Event()
         self.threads: list[threading.Thread] = []
         self._lock = threading.Lock()
@@ -51,13 +54,21 @@ class BeaconRunner:
         self.dropped_frames = 0
         self.last_observation: dict | None = None
         self._last_event_at = 0.0
+        # Remote browser stream state
+        self._remote_mode: bool = self.video_source == "remote"
+        self._last_remote_frame_at: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start(self):
         if self.threads:
             return
         self.stop_signal.clear()
+        capture_target = self._capture_remote if self._remote_mode else self._capture
         self.threads = [
-            threading.Thread(target=self._capture, daemon=True, name="BeaconCapture"),
+            threading.Thread(target=capture_target, daemon=True, name="BeaconCapture"),
             threading.Thread(target=self._process, daemon=True, name="BeaconDetector"),
         ]
         for thread in self.threads:
@@ -70,30 +81,40 @@ class BeaconRunner:
         self.threads.clear()
 
     def switch_source(self, new_source: Union[str, int], synthetic: Optional[bool] = None) -> bool:
-        """Switch video source between live webcam (e.g. 'webcam' or 0) and synthetic fixture file."""
+        """Switch video source between live webcam, remote browser stream, or synthetic fixture."""
         with self._lock:
             self.stop()
-            # Drain queue
             while not self.frames.empty():
                 try:
                     self.frames.get_nowait()
                 except Empty:
                     break
 
+            is_remote = new_source == "remote"
             is_camera = (
-                new_source == "webcam"
-                or isinstance(new_source, int)
-                or (isinstance(new_source, str) and new_source.isdigit())
+                not is_remote and (
+                    new_source == "webcam"
+                    or isinstance(new_source, int)
+                    or (isinstance(new_source, str) and new_source.isdigit())
+                )
             )
-            if is_camera:
+
+            if is_remote:
+                self.video_source = "remote"
+                self.synthetic_input = False if synthetic is None else synthetic
+                self._remote_mode = True
+            elif is_camera:
                 dev_idx = 0 if new_source == "webcam" else int(new_source)
                 self.video_source = dev_idx
                 self.synthetic_input = False if synthetic is None else synthetic
+                self._remote_mode = False
             else:
                 self.video_source = str(new_source)
                 self.synthetic_input = True if synthetic is None else synthetic
+                self._remote_mode = False
 
             self.video_path = str(self.video_source)
+            self._last_remote_frame_at = 0.0
             self.start()
 
             if self.events:
@@ -103,10 +124,38 @@ class BeaconRunner:
                     payload={
                         "source": str(self.video_source),
                         "synthetic_input": self.synthetic_input,
-                        "is_camera": is_camera,
+                        "is_camera": is_camera or is_remote,
+                        "remote_stream": is_remote,
                     },
                 )
             return True
+
+    # ------------------------------------------------------------------
+    # Remote browser-stream injection
+    # ------------------------------------------------------------------
+
+    def inject_frame(self, jpeg_bytes: bytes) -> bool:
+        """Accept a JPEG frame uploaded from the browser's webcam and push into the processing queue.
+        
+        Returns True if the frame was accepted, False if the queue is full (dropped).
+        """
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return False
+        with self._lock:
+            self._last_remote_frame_at = time.monotonic()
+        try:
+            self.frames.put_nowait((frame, time.monotonic()))
+            return True
+        except Full:
+            with self._lock:
+                self.dropped_frames += 1
+            return False
+
+    # ------------------------------------------------------------------
+    # Capture threads
+    # ------------------------------------------------------------------
 
     def _open_capture(self) -> cv2.VideoCapture | None:
         try:
@@ -125,13 +174,22 @@ class BeaconRunner:
             return None
 
     def _capture(self):
+        """Capture thread for local file / local hardware camera."""
         capture = self._open_capture()
         if capture is None or not capture.isOpened():
             if self.events:
                 self.events.emit("perception_failed", component="detector",
                                  payload={"reason": f"Video source '{self.video_source}' unavailable"})
+            # Emit "no signal" frames so the UI doesn't freeze
+            no_signal = _make_no_signal_frame(f"Camera '{self.video_source}' not found on this host.")
+            while not self.stop_signal.is_set():
+                try:
+                    self.frames.put_nowait((no_signal.copy(), time.monotonic()))
+                except Full:
+                    pass
+                self.stop_signal.wait(0.5)
             return
-        
+
         raw_fps = capture.get(cv2.CAP_PROP_FPS) or 15
         fps = 15 if (raw_fps <= 0 or raw_fps > 60) else raw_fps
         interval = 1.0 / fps
@@ -155,6 +213,25 @@ class BeaconRunner:
         finally:
             capture.release()
 
+    def _capture_remote(self):
+        """Capture thread for remote browser stream — frames arrive via inject_frame()."""
+        waiting_frame = _make_waiting_frame()
+        while not self.stop_signal.is_set():
+            with self._lock:
+                last = self._last_remote_frame_at
+            age = time.monotonic() - last if last > 0 else float("inf")
+            if age > _REMOTE_FRAME_TIMEOUT:
+                # No recent browser frame — push the "waiting" placeholder
+                try:
+                    self.frames.put_nowait((waiting_frame.copy(), time.monotonic()))
+                except Full:
+                    pass
+            self.stop_signal.wait(0.4)
+
+    # ------------------------------------------------------------------
+    # Detection / processing thread
+    # ------------------------------------------------------------------
+
     def _process(self):
         consecutive = 0
         while not self.stop_signal.is_set():
@@ -163,25 +240,21 @@ class BeaconRunner:
             except Empty:
                 continue
 
-            # Ensure normalized resolution (640x360) for fast inference & consistent bounding
             if frame.shape[0] != 360 or frame.shape[1] != 640:
                 frame = cv2.resize(frame, (640, 360))
 
-            # HSV red has two ranges around hue wraparound; a minimum area
-            # rejects isolated red pixels from compression/noise.
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             low = cv2.inRange(hsv, (0, 100, 90), (12, 255, 255))
             high = cv2.inRange(hsv, (170, 100, 90), (179, 255, 255))
             mask = cv2.bitwise_or(low, high)
             red_pixels = int(cv2.countNonZero(mask))
-            
-            # Threshold: red beacon or red object held up to camera
+
             active = red_pixels > 650
             consecutive = consecutive + 1 if active else 0
             overlay = frame.copy()
 
-            # For webcam live mode: draw bounding box around candidate region
-            if active and not self.synthetic_input:
+            is_live = not self.synthetic_input
+            if active and is_live:
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for cnt in contours:
                     if cv2.contourArea(cnt) > 200:
@@ -197,6 +270,9 @@ class BeaconRunner:
             if self.synthetic_input:
                 cv2.putText(overlay, "SYNTHETIC VIDEO - LIVE CV DETECTION", (16, 341),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.48, (250, 250, 250), 1)
+            elif self._remote_mode:
+                cv2.putText(overlay, f"BROWSER WEBCAM STREAM - REAL-TIME CV ({red_pixels} px)", (16, 341),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 180), 1)
             else:
                 cv2.putText(overlay, f"LIVE WEBCAM - REAL-TIME CV INSPECTION ({red_pixels} px)", (16, 341),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1)
@@ -211,7 +287,13 @@ class BeaconRunner:
                 drops = self.dropped_frames
                 self.dropped_frames = 0
 
-            detector_name = "Live Webcam HSV Red-Beacon Detector" if not self.synthetic_input else "OpenCV HSV red-beacon detector"
+            if self._remote_mode:
+                detector_name = "Browser Webcam Stream — HSV Red-Beacon Detector"
+            elif not self.synthetic_input:
+                detector_name = "Live Webcam HSV Red-Beacon Detector"
+            else:
+                detector_name = "OpenCV HSV red-beacon detector"
+
             self.telemetry.record_frame(
                 latency,
                 dropped_frames=drops,
@@ -225,7 +307,11 @@ class BeaconRunner:
                 self._record_event(red_pixels)
 
     def _record_event(self, red_pixels: int):
-        if not self.synthetic_input:
+        if self._remote_mode:
+            text = "Red equipment status beacon observed via browser webcam stream in Zone 01"
+            source_ref = "browser://webcam"
+            scenario = "remote browser webcam stream"
+        elif not self.synthetic_input:
             text = "Red equipment status beacon observed by live camera inspection in Zone 01"
             source_ref = "webcam://0"
             scenario = "live webcam inspection"
@@ -246,7 +332,7 @@ class BeaconRunner:
                 "scenario": scenario,
                 "requires_operator_review": True,
             },
-            source_type="live_webcam" if not self.synthetic_input else "beacon_cv",
+            source_type="remote_webcam" if self._remote_mode else ("live_webcam" if not self.synthetic_input else "beacon_cv"),
             source_reference=source_ref,
             observed_at=datetime.now(timezone.utc),
             sharing=SharingPolicy.LOCAL_ONLY,
@@ -274,6 +360,7 @@ class BeaconRunner:
                         "record_id": record.record_id,
                         "synthetic_input": self.synthetic_input,
                         "is_camera": not self.synthetic_input,
+                        "remote_stream": self._remote_mode,
                         "projection_status": receipt.projection_status,
                     },
                 )
@@ -290,9 +377,10 @@ class BeaconRunner:
             return {
                 "running": any(t.is_alive() for t in self.threads),
                 "video_source": str(self.video_source),
-                "source": "webcam" if not self.synthetic_input else "fixture",
+                "source": "remote" if self._remote_mode else ("webcam" if not self.synthetic_input else "fixture"),
                 "synthetic_input": self.synthetic_input,
                 "is_camera": not self.synthetic_input,
+                "remote_stream": self._remote_mode,
                 "processed_frames": self.processed_frames,
                 "frames": self.processed_frames,
                 "drops": 0,
@@ -304,3 +392,26 @@ class BeaconRunner:
                 },
                 "latest_observation": self.last_observation,
             }
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _make_no_signal_frame(reason: str = "Camera unavailable") -> np.ndarray:
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(img, "NO SIGNAL", (200, 155), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 220), 3)
+    cv2.putText(img, reason, (30, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 140, 140), 1)
+    cv2.putText(img, "Use 'Browser Webcam' mode to stream from your device.", (30, 250),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 180, 120), 1)
+    return img
+
+
+def _make_waiting_frame() -> np.ndarray:
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(img, "WAITING FOR BROWSER STREAM", (110, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 160), 2)
+    cv2.putText(img, "Allow camera access and click 'Browser Webcam' to begin.", (60, 205),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, (150, 150, 150), 1)
+    return img
+
+

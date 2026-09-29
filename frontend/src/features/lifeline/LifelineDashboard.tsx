@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import { Activity, AlertTriangle, Box, Camera, CircleGauge, CloudDownload, Database, Eye, HardDrive, ImageOff, MemoryStick, Network, Play, RefreshCw, Search, Server, ShieldCheck, TriangleAlert, Video, WifiOff, Zap } from "lucide-react";
+import { Activity, AlertTriangle, Box, Camera, CircleGauge, CloudDownload, Database, Eye, HardDrive, ImageOff, MemoryStick, Network, Play, RefreshCw, Search, Server, ShieldCheck, TriangleAlert, Video, Wifi, WifiOff, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button"; import { Input } from "@/components/ui/input"; import { Switch } from "@/components/ui/switch";
 import { api, type CoverageState, type StatusSnapshot } from "./api"; import { fixtureFrame } from "./fixtures"; import { useActions, useLifeline } from "./use-lifeline";
 
@@ -9,7 +9,63 @@ function Tone({ children, tone = "neutral" }: { children: ReactNode; tone?: "neu
 function Panel({ title, eyebrow, icon, action, children, className = "" }: { title: string; eyebrow?: string; icon?: ReactNode; action?: ReactNode; children: ReactNode; className?: string }) { return <section className={`panel ${className}`}><header className="panel-head"><div><span className="eyebrow">{eyebrow}</span><h2>{icon}{title}</h2></div>{action}</header>{children}</section>; }
 function Metric({ label, value, note, warn }: { label: string; value: string; note?: string; warn?: boolean }) { return <div className="metric"><div className="metric-label">{label}</div><div className={warn ? "metric-value text-warning" : "metric-value"}>{value}</div>{note && <div className="metric-note">{note}</div>}</div>; }
 function DeviceScene({ data, lowPower }: { data: StatusSnapshot; lowPower: boolean }) { const offline = data.isOffline === true; return <div className={`device-scene ${lowPower ? "is-static" : ""}`} aria-label={`Edge topology: ${offline ? "offline" : data.isOffline === false ? "online" : "link unknown"}`}><div className="scene-grid"/><div className="node edge"><HardDrive/><span>EDGE 01</span><b>{fmt(data.localShards)} shards</b></div><div className={`link ${offline ? "broken" : ""}`}><i/><i/><i/></div><div className="node queue"><Database/><span>LOCAL QUEUE</span><b>{fmt(data.queuedUploads)} pending</b></div><div className={`link secondary ${offline ? "broken" : ""}`}><i/><i/></div><div className="node server"><Server/><span>SERVER NODE</span><b>{offline ? "unreachable" : data.isOffline === false ? "linked" : dash}</b></div><div className="scene-caption"><span className={offline ? "dot warning" : "dot"}/>{data.linkState ?? (offline ? "offline" : data.isOffline === false ? "connected" : "state unknown")}</div></div>; }
-function Frame({ preview, latest, isCamera }: { preview: boolean; latest?: string | undefined; isCamera?: boolean }) { const [src, setSrc] = useState(preview ? fixtureFrame : api.frameUrl()); const [failed, setFailed] = useState(false); useEffect(() => { setFailed(false); setSrc(preview ? fixtureFrame : api.frameUrl()); }, [preview, isCamera]); useEffect(() => { if (preview) return; const timer = setInterval(() => { setSrc(api.frameUrl()); }, 750); return () => clearInterval(timer); }, [preview]); return <div className="frame-wrap">{failed ? <div className="frame-empty"><ImageOff/><strong>Frame unavailable</strong><span>The live image endpoint did not return a usable frame.</span><Button variant="outline" size="sm" onClick={() => { setFailed(false); setSrc(api.frameUrl()); }}><RefreshCw/>Retry frame</Button></div> : <img src={src} alt={preview ? "Synthetic facility frame with a highlighted beacon candidate" : "Latest live inspection frame"} onError={() => setFailed(true)} />}<div className="frame-top"><Tone tone={preview ? "warn" : isCamera ? "ok" : "cyan"}>{preview ? "SYNTHETIC FIXTURE" : isCamera ? "LIVE WEBCAM" : "SYNTHETIC VIDEO"}</Tone><button className="icon-control" aria-label="Refresh inspection frame" title="Refresh frame" onClick={() => setSrc(preview ? fixtureFrame : api.frameUrl())}><RefreshCw/></button></div><div className="frame-bottom"><Eye/><span>{latest ?? "No observation supplied"}</span></div></div>; }
+function Frame({ preview, latest, isCamera, remoteStream }: { preview: boolean; latest?: string | undefined; isCamera?: boolean; remoteStream?: boolean }) { const [src, setSrc] = useState(preview ? fixtureFrame : api.frameUrl()); const [failed, setFailed] = useState(false); useEffect(() => { setFailed(false); setSrc(preview ? fixtureFrame : api.frameUrl()); }, [preview, isCamera, remoteStream]); useEffect(() => { if (preview) return; const timer = setInterval(() => { setSrc(api.frameUrl()); }, 750); return () => clearInterval(timer); }, [preview]); const label = preview ? "SYNTHETIC FIXTURE" : remoteStream ? "BROWSER WEBCAM" : isCamera ? "LIVE WEBCAM" : "SYNTHETIC VIDEO"; const tone = preview ? "warn" : (remoteStream || isCamera) ? "ok" : "cyan"; return <div className="frame-wrap">{failed ? <div className="frame-empty"><ImageOff/><strong>Frame unavailable</strong><span>The live image endpoint did not return a usable frame.</span><Button variant="outline" size="sm" onClick={() => { setFailed(false); setSrc(api.frameUrl()); }}><RefreshCw/>Retry frame</Button></div> : <img src={src} alt={preview ? "Synthetic facility frame with a highlighted beacon candidate" : "Latest live inspection frame"} onError={() => setFailed(true)} />}<div className="frame-top"><Tone tone={tone}>{label}</Tone><button className="icon-control" aria-label="Refresh inspection frame" title="Refresh frame" onClick={() => setSrc(preview ? fixtureFrame : api.frameUrl())}><RefreshCw/></button></div><div className="frame-bottom"><Eye/><span>{latest ?? "No observation supplied"}</span></div></div>; }
+
+/**
+ * Invisible background component: captures frames from browser webcam via getUserMedia,
+ * draws them to a canvas, encodes as JPEG and POSTs to /perception/frame/upload.
+ * Only runs when active=true.
+ */
+function BrowserStream({ active }: { active: boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!active) {
+      // Stop stream if deactivated
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+      if (videoRef.current) videoRef.current.srcObject = null;
+      return;
+    }
+
+    let cancelled = false;
+    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360, frameRate: 10 }, audio: false })
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+        streamRef.current = stream;
+        if (videoRef.current) { videoRef.current.srcObject = stream; void videoRef.current.play(); }
+
+        timerRef.current = setInterval(() => {
+          const video = videoRef.current;
+          const canvas = canvasRef.current;
+          if (!video || !canvas || video.readyState < 2) return;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          canvas.width = 640; canvas.height = 360;
+          ctx.drawImage(video, 0, 0, 640, 360);
+          canvas.toBlob((blob) => { if (blob) void api.uploadBrowserFrame(blob); }, "image/jpeg", 0.75);
+        }, 200); // ~5 fps upload rate
+      })
+      .catch((err) => console.warn("[BrowserStream] getUserMedia failed:", err));
+
+    return () => {
+      cancelled = true;
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+    };
+  }, [active]);
+
+  return (
+    <>
+      <video ref={videoRef} style={{ display: "none" }} playsInline muted />
+      <canvas ref={canvasRef} style={{ display: "none" }} />
+    </>
+  );
+}
+
 const coverLabels: Record<CoverageState, string> = { searched: "Searched", queued: "Queued", unavailable_offline: "Unavailable offline", skipped_for_budget: "Skipped for budget", failed: "Failed" };
 
 export function LifelineDashboard() {
@@ -24,8 +80,9 @@ export function LifelineDashboard() {
   <div className="dashboard">
    <section id="overview" className="overview-grid"><div className="overview-title"><span className="eyebrow">SYSTEM / EDGE-01</span><h1>Operational memory at the edge.</h1><p>Inspection, retrieval, shard state and synchronization in one bounded console.</p><div className="status-row"><Tone tone={state === "error" ? "error" : error ? "warn" : "ok"}>{state === "loading" ? "LOADING LIVE STATE" : state === "error" ? "LIVE DATA UNAVAILABLE" : error ? "PARTIAL LIVE STATE" : "SYSTEM RESPONDING"}</Tone><span>Updated {updatedAt ? updatedAt.toLocaleTimeString() : dash}</span>{error && <span className="error-copy">{error}</span>}</div></div><DeviceScene data={status} lowPower={lowPower}/></section>
    <section className="metrics-strip"><Metric label="ENGINE FPS" value={fmt(status.fps)} note="reported rate"/><Metric label="P95 LATENCY" value={fmt(status.p95LatencyMs, " ms")} note="end-to-end"/><Metric label="MEMORY" value={bytes(status.memoryUsedBytes)} note={status.memoryBudgetBytes === undefined ? "budget —" : `of ${bytes(status.memoryBudgetBytes)}`}/><Metric label="QUEUED UPLOADS" value={fmt(status.queuedUploads)} note="awaiting transfer" warn={(status.queuedUploads ?? 0) > 0}/><Metric label="LINK TEST" value={status.linkState ?? dash} note={offline ? "offline" : "network status"} warn={offline}/></section>
-   <div className="content-grid">
-    <Panel title="Live inspection" eyebrow="PERCEPTION / FRAME" icon={<Eye/>} className="inspection-panel" action={<div className="inline-stats"><span>Frames <b>{fmt(status.frames)}</b></span><span>Drops <b>{fmt(status.drops)}</b></span><span>Depth <b>{fmt(status.depth)}</b></span></div>}><div id="inspection" className="inspection-layout"><Frame preview={mode === "preview"} latest={status.latestObservation} isCamera={status.isCamera}/><div className="detector-side"><Tone tone="warn">REVIEW INDICATOR — NOT A DIAGNOSIS</Tone><h3>{status.detectorName ?? "Detector not identified"}</h3><p>{status.detectorSource ? `Source: ${status.detectorSource}.` : "Detector source not supplied."} Candidates require operator review.</p>{mode === "live" && <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.6rem", marginBottom: "0.6rem", flexWrap: "wrap" }}><Button variant={status.isCamera ? "default" : "outline"} size="sm" disabled={!!actions.busy} onClick={() => void actions.run("camera", () => api.setPerceptionSource("webcam"), "Switched to Live Webcam")}><Camera className="w-3.5 h-3.5 mr-1"/>Live Webcam</Button><Button variant={!status.isCamera ? "default" : "outline"} size="sm" disabled={!!actions.busy} onClick={() => void actions.run("fixture", () => api.setPerceptionSource("fixture"), "Switched to Synthetic Fixture")}><Video className="w-3.5 h-3.5 mr-1"/>Synthetic Fixture</Button></div>}{mode === "live" && status.isCamera && <div style={{ fontSize: "0.78rem", padding: "0.4rem 0.6rem", borderRadius: "0.375rem", background: "rgba(234, 179, 8, 0.12)", color: "#eab308", border: "1px solid rgba(234, 179, 8, 0.25)" }}>💡 <strong>Live Demo:</strong> Hold up any red object (mug, pen, or phone screen) to trigger the hazard detector in real time.</div>}<div className="procedure"><span>SYNTHETIC PROCEDURE PLACEHOLDER</span><strong>Verify the physical indicator before any action.</strong><p>No operational procedure has been supplied by the backend.</p></div></div></div></Panel>
+    <div className="content-grid">
+     <Panel title="Live inspection" eyebrow="PERCEPTION / FRAME" icon={<Eye/>} className="inspection-panel" action={<div className="inline-stats"><span>Frames <b>{fmt(status.frames)}</b></span><span>Drops <b>{fmt(status.drops)}</b></span><span>Depth <b>{fmt(status.depth)}</b></span></div>}><div id="inspection" className="inspection-layout"><Frame preview={mode === "preview"} latest={status.latestObservation} isCamera={status.isCamera} remoteStream={status.remoteStream}/><div className="detector-side"><Tone tone="warn">REVIEW INDICATOR — NOT A DIAGNOSIS</Tone><h3>{status.detectorName ?? "Detector not identified"}</h3><p>{status.detectorSource ? `Source: ${status.detectorSource}.` : "Detector source not supplied."} Candidates require operator review.</p>{mode === "live" && <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.6rem", marginBottom: "0.6rem", flexWrap: "wrap" }}><Button variant={status.remoteStream ? "default" : "outline"} size="sm" disabled={!!actions.busy} onClick={() => void actions.run("remote", () => api.setPerceptionSource("remote"), "Switched to Browser Webcam")}><Wifi className="w-3.5 h-3.5 mr-1"/>Browser Webcam</Button><Button variant={status.isCamera && !status.remoteStream ? "default" : "outline"} size="sm" disabled={!!actions.busy} onClick={() => void actions.run("camera", () => api.setPerceptionSource("webcam"), "Switched to Local Webcam")}><Camera className="w-3.5 h-3.5 mr-1"/>Local Webcam</Button><Button variant={!status.isCamera ? "default" : "outline"} size="sm" disabled={!!actions.busy} onClick={() => void actions.run("fixture", () => api.setPerceptionSource("fixture"), "Switched to Synthetic Fixture")}><Video className="w-3.5 h-3.5 mr-1"/>Synthetic Fixture</Button></div>}{mode === "live" && status.remoteStream && <div style={{ fontSize: "0.78rem", padding: "0.4rem 0.6rem", borderRadius: "0.375rem", background: "rgba(0,200,130,0.10)", color: "#00c882", border: "1px solid rgba(0,200,130,0.25)" }}>📡 <strong>Browser Webcam active:</strong> Your camera is being streamed to the cloud server for real-time CV processing. Hold up a red object to trigger the hazard detector.</div>}{mode === "live" && status.isCamera && !status.remoteStream && <div style={{ fontSize: "0.78rem", padding: "0.4rem 0.6rem", borderRadius: "0.375rem", background: "rgba(234, 179, 8, 0.12)", color: "#eab308", border: "1px solid rgba(234, 179, 8, 0.25)" }}>💡 <strong>Live Demo:</strong> Hold up any red object (mug, pen, or phone screen) to trigger the hazard detector in real time.</div>}<div className="procedure"><span>SYNTHETIC PROCEDURE PLACEHOLDER</span><strong>Verify the physical indicator before any action.</strong><p>No operational procedure has been supplied by the backend.</p></div></div></div></Panel>
+
     <Panel title="Recent events" eyebrow="LATEST / 30" icon={<Zap/>} action={<Button size="icon" variant="ghost" title="Refresh live data" aria-label="Refresh live data" disabled={state === "loading"} onClick={() => void refresh()}><RefreshCw className={state === "loading" ? "spin" : ""}/></Button>}><div className="event-list">{events.length ? events.slice(0,6).map((e) => <div className="event" key={e.id}><span className={`event-mark ${e.severity === "warning" ? "warn" : e.severity === "error" ? "err" : ""}`}/><div><strong>{e.type ?? "Event"}</strong><p>{e.message ?? dash}</p></div><time>{e.at ?? dash}</time></div>) : <Empty text={state === "loading" ? "Loading recent events…" : "No events supplied"}/>}</div></Panel>
     <Panel title="Memory search" eyebrow="RETRIEVAL / TEXT" icon={<Search/>} className="search-panel"><form id="memory" className="search-form" onSubmit={(e) => { e.preventDefault(); if (query.trim()) void actions.doSearch(query.trim(), context, k); }}><label><span>Search memory</span><Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Observation, asset or event…"/></label><label><span>Context</span><Input value={context} onChange={(e) => setContext(e.target.value)} placeholder="active"/></label><label className="k-field"><span>Top K</span><Input type="number" min={1} max={50} value={k} onChange={(e) => setK(Math.max(1, Number(e.target.value) || 1))}/></label><Button type="submit" disabled={!query.trim() || actions.busy === "search"}>{actions.busy === "search" ? <RefreshCw className="spin"/> : <Search/>}Search</Button></form>{actions.search ? <><div className="coverage">{Object.entries(coverLabels).map(([key,label]) => <span key={key}>{label}<b>{fmt(actions.search?.coverage[key as CoverageState])}</b></span>)}<span>Shortfall<b>{fmt(actions.search.shortfall)}</b></span><span>Elapsed<b>{fmt(actions.search.elapsedMs," ms")}</b></span>{actions.search.partial && <Tone tone="warn">PARTIAL RESULT</Tone>}</div><div className="hit-grid">{actions.search.hits.length ? actions.search.hits.map((h) => <article className="hit" key={h.id}><div><Tone tone={h.contested ? "warn" : "cyan"}>{h.contested ? "CONTESTED" : `SCORE ${h.score?.toFixed(2) ?? dash}`}</Tone><span>{h.sourceShard ?? dash} / {h.revision ?? dash}</span></div><p>{h.observation ?? dash}</p></article>) : <Empty text="Search completed with no hits"/>}</div></> : <Empty text="Run a query to inspect memory coverage and ranked observations"/>}</Panel>
     <Panel title="Shard explorer" eyebrow="MEMORY / SHARDS" icon={<MemoryStick/>}><div className="shard-head"><span>Shard</span><span>Protocol</span><span>Mode</span><span>Availability</span></div><div className="shards">{displayedShards.length ? displayedShards.map((s) => <div className="shard" key={s.id}><div><Box/><strong>{s.id}</strong><small>{s.location === "server_prepared" ? "SERVER-PREPARED" : s.location === "local" ? "LOCAL" : dash}</small></div><code>{s.protocol ?? dash}</code><span>{s.mutable ? "LOCAL-WRITE / MUTABLE" : s.mutable === false ? "PINNED / READ-ONLY" : dash}{s.activeContext ? " · ACTIVE" : ""}</span><span>{s.availability ?? dash}{s.eviction ? ` · eviction ${s.eviction}` : ""}</span></div>) : <Empty text="No shard inventory supplied"/>}</div></Panel>
@@ -34,6 +91,7 @@ export function LifelineDashboard() {
    </div>
   </div>
   {(actions.message || actions.actionError) && <div className={`toast ${actions.actionError ? "is-error" : ""}`} role="status">{actions.actionError ? <AlertTriangle/> : <ShieldCheck/>}<span>{actions.actionError ?? actions.message}</span></div>}
+  {mode === "live" && <BrowserStream active={status.remoteStream === true} />}
   <footer><span>LIFELINE / LOCAL-FIRST OPERATIONS</span><label><Switch checked={lowPower} onCheckedChange={setLowPower}/><span>Low-power display</span></label><span>Missing backend values display as {dash}</span></footer>
  </main>;
 }
