@@ -1,0 +1,129 @@
+# LIFELINE — 2-Minute Live Demo
+
+### 0:00–0:15 — The problem
+
+**[Show the dashboard]**
+
+> “Imagine an inspection robot working deep inside a mine, on an offshore platform, or somewhere with unreliable connectivity.
+>
+> It has limited RAM and CPU, but it still needs to perceive its environment, remember what it has seen, and retrieve the right procedure — even when the network disappears.
+>
+> That’s the problem we built **LIFELINE** to solve: an offline-first memory and retrieval system for resource-constrained edge devices.”
+
+---
+
+### 0:15–0:40 — Live perception
+
+**[Click “Browser Webcam”]**
+
+> “Let me start with perception.
+>
+> This is a browser webcam stream being sent to the edge backend. The backend runs a lightweight OpenCV red-beacon detector — our deliberately bounded stand-in for a much heavier industrial vision model.
+>
+> I’ll hold up this red object.
+>
+> **[Hold up red object]**
+>
+> You can see the detector identify the beacon in real time.
+>
+> And this isn't just a box drawn on the screen. After consecutive detections, LIFELINE creates an actual observation record with the context, source, timestamp, and embedding, and sends it through the same memory pipeline that the rest of the system uses.”
+
+The repository implements browser-frame upload through `/perception/frame/upload`; the detector labels the source as a browser webcam stream and records an observation after consecutive detections.
+
+---
+
+### 0:40–1:05 — Memory under a hard constraint
+
+**[Point to the memory metric and open Shard Explorer]**
+
+> “Now here's the core of LIFELINE.
+>
+> An edge device can't simply load an enormous vector database into RAM.
+>
+> So instead, the knowledge is divided into small vector shards.
+>
+> **[Point to Shard Explorer]**
+>
+> Critical procedures, like emergency protocols, are pinned in memory. Other contexts, such as different inspection zones, can be loaded when they're needed.
+>
+> The ShardManager continuously tracks the working set. When memory pressure increases, it uses deterministic LRU eviction to unload inactive shards while protecting active searches and pinned critical knowledge.”
+
+The repo implements a 400 MB soft working-set budget, deterministic LRU eviction, reader leases, a non-evictable `local_write` shard, pinned `emergency_protocols`, and on-demand zone shards.
+
+---
+
+### 1:05–1:25 — Search locally, not in the cloud
+
+**[Click Seed Demo → open Memory Search]**
+
+> “Before searching, I'll seed the demonstration data.
+>
+> **[Click ‘Seed demo’]**
+>
+> This creates our demonstration procedure cards and zone history, so we can work with a populated edge memory.”
+
+**[Search: `fire`, `leak`, or `hazard`]**
+
+> “Now I'll search for something like ‘fire’ or ‘hazard’.
+>
+> This search is happening against the active local contexts and emergency procedures.
+>
+> The important part is the coverage information: LIFELINE makes it explicit which shards were searched, which were skipped because of the memory budget, and which were unavailable.
+>
+> So instead of pretending the device searched everything, the system tells us exactly what knowledge was available at the edge.”
+
+The `/demo/seed` endpoint creates demo procedure and zone-history records, while `/search/text` performs local search and returns coverage states including searched, queued, unavailable-offline, skipped-for-budget, and failed.
+
+---
+
+### 1:25–1:50 — Survive the network failure
+
+**[Open Sync panel]**
+
+> “Now let's remove the network.
+>
+> **[Turn on ‘Demo network fault injection’]**
+>
+> This simulates the robot losing connectivity.
+>
+> But the edge system itself keeps running. Perception continues. Local memory continues. Search continues.
+>
+> And importantly, observations aren't dependent on the network to become durable.
+>
+> They are committed to the local SQLite memory layer first, and unsynchronized records are maintained in the outbox for later upload.”
+
+The repository describes SQLite as the authoritative durable layer and maintains an urgent outbox for synchronization. The dashboard exposes network fault injection and sync status.
+
+---
+
+### 1:50–2:05 — Reconnect and sync
+
+**[Turn fault injection OFF → click “Trigger Sync”]**
+
+> “Now connectivity is restored.
+>
+> **[Turn off fault injection]**
+>
+> I'll trigger synchronization.
+>
+> **[Click ‘Trigger Sync’]**
+>
+> The queued records can now be processed by the upload worker and handed to the upstream ingestion layer.
+>
+> The larger architecture then prepares optimized vector indexes and snapshots that can be handed back to the edge device.”
+
+The edge exposes `/sync/trigger`, which immediately processes an outbox batch; the documented three-tier architecture connects the edge upload worker to the upstream ingestion server and then Qdrant Cloud.
+
+---
+
+### 2:05–2:15 — Close
+
+**[Return to the main dashboard]**
+
+> “So that's LIFELINE.
+>
+> **Perceive locally. Remember durably. Search within the memory you can afford. Survive the network going away. And synchronize when it comes back.**
+>
+> The goal isn't to put the entire cloud on a robot.
+>
+> It's to make sure the robot always has the right memory available when it needs it.”

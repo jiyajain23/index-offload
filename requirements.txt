@@ -1,7 +1,7 @@
 qdrant-edge-py==0.8.0
 qdrant-client==1.19.1
 numpy>=2.0.0
-psutil>=7.0.0
+psutil==7.0.0
 pytest>=9.0.0
 fastapi>=0.140.0
 pydantic>=2.10.0

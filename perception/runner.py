@@ -335,7 +335,7 @@ class BeaconRunner:
             source_type="remote_webcam" if self._remote_mode else ("live_webcam" if not self.synthetic_input else "beacon_cv"),
             source_reference=source_ref,
             observed_at=datetime.now(timezone.utc),
-            sharing=SharingPolicy.LOCAL_ONLY,
+            sharing=SharingPolicy.PERMITTED_SHARED,
             priority=PriorityLevel.ROUTINE,
             embedding_model_version=MODEL_VERSION,
             dense_vector=dense,
