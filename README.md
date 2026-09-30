@@ -172,13 +172,13 @@ python -m uvicorn server.server:app --host 0.0.0.0 --port 8001
 cd frontend && npm run dev
 ```
 
-| Service | URL |
-|---|---|
+| Service | URL | Link |
+|---|---|---|
 | Operations dashboard | http://localhost:8000/dashboard |
-| Landing page | http://localhost:8000/ |
-| Vite dev server (hot reload) | http://localhost:5173/dashboard |
-| Edge API explorer | http://localhost:8000/docs |
-| Ingestion health | http://localhost:8001/health |
+| Landing page | http://localhost:8000/ | 
+| Vite dev server (hot reload) | http://localhost:5173/dashboard | https://lifeline-ui.onrender.com |
+| Edge API explorer | http://localhost:8000/docs | https://lifeline-backend-bcuc.onrender.com |
+| Ingestion health | http://localhost:8001/health | https://lifeline-ingest.onrender.com |
 
 A `Dockerfile` and `compose.yaml` are included for containerised runs.
 
